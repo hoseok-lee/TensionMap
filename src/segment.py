@@ -79,6 +79,7 @@ class Segmenter:
 
         obj.V_df, cc = self.find_vertices(mask_tmp, obj.C_df)
         obj.E_df = self.find_edges(obj, mask_tmp, cc)
+        obj = self.inject_isolated_cell_topology(obj, mask_tmp)
         self.identify_holes(obj)
         return obj, mask_tmp
 
@@ -190,13 +191,15 @@ class Segmenter:
         areas = obj.C_df['area'].to_numpy()
         for i in range(obj.C_df.shape[0]):
             vcoords = np.array(obj.V_df.loc[obj.C_df.at[i, 'nverts'], 'coords'].tolist())
-            # if vcoords.shape[0] >= 3:
-            try:
-                hull = ConvexHull(vcoords)
-                if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 2*np.median(areas):
-                    obj.C_df.at[i, 'holes'] = True
-            # else:
-            except:
+            if vcoords.shape[0] >= 3:
+                try:
+                    hull = ConvexHull(vcoords)
+                    if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 2*np.median(areas):
+                        obj.C_df.at[i, 'holes'] = True
+                # else:
+                except:
+                    pass
+            else:
                 obj.C_df.at[i, 'holes'] = True
         return
 
@@ -314,6 +317,93 @@ class Segmenter:
         neighborhood_count = ndi.convolve(image,k, mode='constant', cval=1)
         neighborhood_count[~image.astype(bool)] = 0
         return neighborhood_count == 1
+
+    def inject_isolated_cell_topology(self, obj, mask_tmp, n_verts=6):
+        """
+        For cells with no real-cell neighbors (isolated / suspended cells), sample
+        n_verts artificial vertices along the cell contour and create edges shared
+        with the background (cell 0).  This lets VMSI infer their mechanics via
+        infer_isolated_cells() using Young-Laplace directly.
+
+        :param obj: VMSI_obj populated by find_cells / find_vertices / find_edges.
+        :param mask_tmp: labelled mask (same coordinate system used throughout).
+        :param n_verts: number of artificial vertices to place around each isolated cell.
+        """
+        for cell_idx in range(1, len(obj.C_df)):
+            if obj.C_df.at[cell_idx, 'nverts'].size > 0:
+                continue  # cell already has topology from real junctions
+
+            cell_mask = (mask_tmp == cell_idx).astype(float)
+            contours = measure.find_contours(cell_mask, 0.5)
+            if not contours:
+                continue
+            contour = max(contours, key=len)      # (N, 2) in (row, col)
+            contour_xy = contour[:, ::-1].copy()  # convert to (x, y)
+
+            # Arc-length parameterisation of the contour
+            diffs = np.diff(contour_xy, axis=0)
+            arc_lens = np.concatenate([[0.0],
+                                       np.cumsum(np.linalg.norm(diffs, axis=1))])
+            total_len = arc_lens[-1]
+            if total_len == 0:
+                continue
+
+            # Interpolate n_verts positions at equal arc-length spacing
+            targets = np.linspace(0, total_len, n_verts, endpoint=False)
+            sampled_pts = np.stack([
+                np.interp(targets, arc_lens, contour_xy[:, 0]),
+                np.interp(targets, arc_lens, contour_xy[:, 1])
+            ], axis=1)
+
+            # --- vertices ---
+            start_v = len(obj.V_df)
+            v_indices = np.arange(start_v, start_v + n_verts, dtype=int)
+
+            for i, pt in enumerate(sampled_pts):
+                obj.V_df = pd.concat([obj.V_df, pd.DataFrame({
+                    'coords': [pt.tolist()],
+                    'ncells': [np.array([0, cell_idx])],
+                    'nverts': [np.array([v_indices[(i - 1) % n_verts],
+                                         v_indices[(i + 1) % n_verts]])],
+                    'edges':  [np.array([])]
+                })], ignore_index=True)
+
+            # --- edges ---
+            start_e = len(obj.E_df)
+
+            for i in range(n_verts):
+                v1 = int(v_indices[i])
+                v2 = int(v_indices[(i + 1) % n_verts])
+                pt1 = sampled_pts[i]
+                pt2 = sampled_pts[(i + 1) % n_verts]
+
+                # draw.line expects (row, col) = (y, x)
+                line = draw.line(int(round(pt1[1])), int(round(pt1[0])),
+                                 int(round(pt2[1])), int(round(pt2[0])))
+                pix = np.ravel_multi_index(np.flip(line, axis=0),
+                                           mask_tmp.shape[::-1])
+                e_idx = start_e + i
+
+                obj.E_df = pd.concat([obj.E_df, pd.DataFrame({
+                    'pixels': [pix],
+                    'verts':  [np.array([v1, v2])],
+                    'cells':  [np.array([0, cell_idx])]
+                })], ignore_index=True)
+
+                obj.V_df.at[v1, 'edges'] = np.append(obj.V_df.at[v1, 'edges'], e_idx)
+                obj.V_df.at[v2, 'edges'] = np.append(obj.V_df.at[v2, 'edges'], e_idx)
+
+            # --- update C_df ---
+            obj.C_df.at[cell_idx, 'nverts'] = v_indices
+            obj.C_df.at[cell_idx, 'numv']   = n_verts
+            obj.C_df.at[cell_idx, 'ncells'] = np.array([0])
+            obj.C_df.at[cell_idx, 'edges']  = np.arange(start_e, start_e + n_verts,
+                                                          dtype=int)
+
+            obj.C_df.at[0, 'ncells'] = np.append(obj.C_df.at[0, 'ncells'], cell_idx)
+            obj.C_df.at[0, 'nverts'] = np.append(obj.C_df.at[0, 'nverts'], v_indices)
+
+        return obj
 
     def segment_image(self, diameter=None, channels=[0,0], use_model='default'):
         """

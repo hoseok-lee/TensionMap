@@ -1165,6 +1165,7 @@ class VMSI():
         # compute the tensions
         T = self.get_tensions(q, p, theta)
         self.upload_mechanics(p, T, q, theta)
+        self.infer_isolated_cells()
         return
 
 
@@ -1210,6 +1211,46 @@ class VMSI():
 
     def return_pressures(self):
         return self.cells.pressure.values[1:]
+
+    def infer_isolated_cells(self, background_pressure=0.0):
+        """
+        Directly infer tension and pressure for cells that touch only the
+        background (cell 0) — i.e. suspended / isolated cells.
+
+        Uses Young-Laplace arc-by-arc: T_i = delta_p * R_i, where R_i is the
+        radius of curvature of the i-th membrane arc fitted by fit_circle().
+        delta_p (= p_cell - p_background) is normalised to 1 to match the
+        relative-pressure convention used by the main VMSI fit.
+
+        For straight arcs (R = inf) the tension is set to zero, indicating the
+        arc provides no curvature information.
+
+        :param background_pressure: reference pressure to assign to cell 0.
+                                    Default 0.0 (relative scale).
+        :return: list of cell indices that were processed.
+        """
+        isolated = [
+            c for c in range(1, len(self.cells))
+            if (len(self.cells.at[c, 'ncells']) == 1
+                and int(self.cells.at[c, 'ncells'][0]) == 0)
+        ]
+
+        for cell_idx in isolated:
+            cell_edges = self.cells.at[cell_idx, 'edges']
+            if not hasattr(cell_edges, '__len__') or len(cell_edges) == 0:
+                continue
+            cell_edges = np.array(cell_edges, dtype=int)
+            cell_edges = cell_edges[cell_edges >= 0]
+
+            # Normalise so delta_p = 1 (same convention as main VMSI fit)
+            delta_p = 1.0
+            self.cells.at[cell_idx, 'pressure'] = background_pressure + delta_p
+
+            for e in cell_edges:
+                r = self.edges.at[e, 'radius']
+                self.edges.at[e, 'tension'] = delta_p * r if np.isfinite(r) else 0.0
+
+        return isolated
 
     def compute_stresstensor(self):
         """
