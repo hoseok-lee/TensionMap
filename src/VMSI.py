@@ -299,7 +299,7 @@ class VMSI():
                     num_v = len(self.vertices)
                     num_e = len(self.edges)
 
-                    nverts = self.vertices['nverts'][v]
+                    nverts = np.array(self.vertices['nverts'][v])
                     nedges = self.vertices['edges'][v]
                     ncells = self.vertices['ncells'][v]
 
@@ -322,6 +322,7 @@ class VMSI():
                     pos_verts = np.zeros_like(nverts)
                     pos_verts[indices] = 1
                     neg_verts = 1 - pos_verts
+                    
 
                     # change vertex with current index to negative vertex
                     self.vertices.at[v,'coords'] = rV2.tolist()
@@ -331,7 +332,16 @@ class VMSI():
                     neg_cells = ncells[[(sum(np.isin(nverts[neg_verts.astype('bool')], self.cells['nverts'][cell]))==2) for cell in ncells]]
 
                     # add positive vertex
-                    self.vertices = self.vertices.append({'coords':[0,0],'ncells':np.array([]),'nverts':np.array([]),'edges':np.array([])}, ignore_index=True)
+                    self.vertices = pd.concat(
+                        [
+                            self.vertices, 
+                            pd.DataFrame({
+                                'coords': [np.array([0,0])],
+                                'ncells': [np.array([])],
+                                'nverts': [np.array([])],
+                                'edges': [np.array([])],
+                                'fourfold': False})
+                        ], ignore_index=True)
                     self.vertices.at[num_v,'coords'] = rV1.tolist()
                     self.vertices.at[num_v,'nverts'] = np.concatenate((nverts[pos_verts.astype('bool')], np.array([v])))
                     self.vertices.at[num_v,'fourfold'] = False
@@ -357,9 +367,18 @@ class VMSI():
 
                     # create new edge between new vertices
                     # edge is only one pixel long so no need to add pixels
-                    self.edges = self.edges.append({'pixels':np.array([]),'verts':np.array([]),'cells':np.array([]),
-                                                    'radius':np.array([]), 'rho':np.array([]), 'fitenergy':np.Inf, 'tension':float(0)},ignore_index=True)
-
+                    self.edges = pd.concat(
+                        [
+                            self.edges, 
+                            pd.DataFrame({
+                                'pixels': [np.array([])],
+                                'verts': [np.array([])],
+                                'cells': [np.array([])],
+                                'radius': [np.array([])],
+                                'rho': [np.array([])],
+                                'fitenergy': np.Inf,
+                                'tension': float(0)})
+                        ], ignore_index=True)
                     self.edges.at[num_e,'verts'] = np.array([v, num_v])
                     self.edges.at[num_e,'cells'] = joint_cells
                     self.edges.at[num_e,'pixels'] = np.array([])

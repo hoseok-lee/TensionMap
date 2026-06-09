@@ -54,7 +54,7 @@ def _bwmorph_luts(image, luts, n_iter=None, padding=0):
         # count down to iteration limit (or endlessly negative)
         n -= 1
 
-    return im.astype(np.bool)
+    return im.astype(bool)
 
 
 # lookup tables for thin
@@ -70,7 +70,7 @@ G123_LUT = np.array([0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
        0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
        0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 0, 0,
        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1,
-       0, 0, 0], dtype=np.bool)
+       0, 0, 0], dtype=bool)
 
 G123P_LUT = np.array([0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0,
        0, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -83,7 +83,7 @@ G123P_LUT = np.array([0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0
        0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0, 0, 0, 0, 0, 1, 0,
        1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 1, 0, 1,
        0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-       0, 0, 0], dtype=np.bool)
+       0, 0, 0], dtype=bool)
 
 THIN_LUTS=[G123_LUT, G123P_LUT]
 
@@ -168,7 +168,7 @@ SPUR_LUT = np.array([1, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 1, 0, 0, 0,
                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0,
                      0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
                      0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=np.bool)
+                     0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], dtype=bool)
 
 
 def spur(image, n_iter=None):
@@ -229,7 +229,7 @@ def _neighbors_conv(image):
     image = image.astype(np.int)
     k = np.array([[1,1,1],[1,0,1],[1,1,1]])
     neighborhood_count = ndi.convolve(image,k, mode='constant', cval=1)
-    neighborhood_count[~image.astype(np.bool)] = 0
+    neighborhood_count[~image.astype(bool)] = 0
     return neighborhood_count
 
 
@@ -270,7 +270,7 @@ def endpoints(image):
 # here's how to make the LUTs
 
 def nabe(n):
-    return np.array([n>>i&1 for i in range(0,9)]).astype(np.bool)
+    return np.array([n>>i&1 for i in range(0,9)]).astype(bool)
 
 def hood(n):
     return np.take(nabe(n), np.array([[3, 2, 1],

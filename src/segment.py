@@ -138,7 +138,9 @@ class Segmenter:
                     if np.intersect1d(v1_ncells, v2_ncells).size >=2:
                         adj[i,j] = 1
                         adj[j,i] = 1
-            V_df['nverts'].iloc[i] = np.where(adj[i,:]==1)[0]
+            # Ensure that the list format remains
+            # Pandas will force single-element np.ndarrays to be an integer (not iterable)
+            V_df['nverts'].iloc[i] = np.where(adj[i,:]==1)[0].tolist()
         return V_df, cc
 
     def find_branch_points(self, skel):
@@ -188,11 +190,13 @@ class Segmenter:
         areas = obj.C_df['area'].to_numpy()
         for i in range(obj.C_df.shape[0]):
             vcoords = np.array(obj.V_df.loc[obj.C_df.at[i, 'nverts'], 'coords'].tolist())
-            if vcoords.shape[0] >= 3:
+            # if vcoords.shape[0] >= 3:
+            try:
                 hull = ConvexHull(vcoords)
                 if hull.simplices.shape[0] < vcoords.shape[0] and obj.C_df.at[i, 'area'] > 2*np.median(areas):
                     obj.C_df.at[i, 'holes'] = True
-            else:
+            # else:
+            except:
                 obj.C_df.at[i, 'holes'] = True
         return
 
@@ -264,9 +268,9 @@ class Segmenter:
                 edge_2 = np.argwhere((np.vstack(E_df['verts'])[:,1] == v)*(np.vstack(E_df['verts'])[:,0] == nv))
 
                 if edge_1.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1)
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1[0])
                 elif edge_2.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2)
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2[0])
                 elif (v not in obj.C_df.at[0, 'nverts']) and (nv not in obj.C_df.at[0, 'nverts']):
                     # Create new edge
                     line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0], obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
@@ -282,7 +286,8 @@ class Segmenter:
         for c in range(1, len(obj.C_df)):
             c_verts = obj.C_df.at[c, 'nverts']
 
-            if len(c_verts) > 1:
+            # np.ndarray uses size
+            if c_verts.size > 1:
                 c_coords = np.vstack(obj.V_df.loc[c_verts, 'coords'].to_list())
                 c_coords = c_coords - np.mean(c_coords, axis=0)
 
@@ -304,10 +309,10 @@ class Segmenter:
     def endpoints(self, image):
         # Define endpoint as pixel with only 1 4-connected neighbor
         # This requires the skeletonized image to be 4-connnected
-        image = image.astype(np.int)
+        image = image.astype(int)
         k = np.array([[0,1,0],[1,0,1],[0,1,0]])
         neighborhood_count = ndi.convolve(image,k, mode='constant', cval=1)
-        neighborhood_count[~image.astype(np.bool)] = 0
+        neighborhood_count[~image.astype(bool)] = 0
         return neighborhood_count == 1
 
     def segment_image(self, diameter=None, channels=[0,0], use_model='default'):
