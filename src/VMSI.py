@@ -358,7 +358,7 @@ class VMSI():
                     for vert in nverts[pos_verts.astype('bool')]:
                         self.vertices.at[vert, 'nverts'][self.vertices['nverts'][vert] == v] = num_v
 
-                    joint_cells = ncells[np.invert(np.isin(ncells, np.array([pos_cell, neg_cells])))]
+                    joint_cells = ncells[np.invert(np.isin(ncells, np.concatenate([pos_cell, neg_cells])))]
 
                     self.vertices.at[v,'ncells'] = np.concatenate((joint_cells, neg_cells))
                     self.vertices.at[num_v,'ncells'] = np.concatenate((joint_cells, pos_cell))
