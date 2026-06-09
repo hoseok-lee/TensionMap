@@ -303,6 +303,12 @@ class VMSI():
                     nedges = self.vertices['edges'][v]
                     ncells = self.vertices['ncells'][v]
 
+                    # -1 is a sentinel meaning no edge exists between two topological
+                    # neighbours (set by find_edges when one vertex borders cell 0).
+                    # Splitting this vertex would corrupt the edge/cell data structures.
+                    if np.any(np.array(nedges, dtype=float) < 0):
+                        break
+
                     R = np.array([self.vertices['coords'][vert] for vert in nverts])
                     rV = np.array(self.vertices['coords'][v])
 
