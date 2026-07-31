@@ -603,6 +603,23 @@ class VMSI():
 
         self.build_diff_operators()
 
+        v_coords = np.concatenate([self.vertices['coords'][self.involved_vertices].tolist()])
+
+        e_chord = np.matmul(self.dV, v_coords)
+
+        # Some edges end up with coincident endpoint coordinates (e.g. a
+        # degenerate vertex split in remove_fourfold, or duplicate points from
+        # noisy segmentation topology), giving a zero-length chord. tau below
+        # normalises this vector, so a zero chord silently produces NaN
+        # (warnings are suppressed in run_VMSI) that later makes SVD in
+        # estimate_pressure's lstsq fail to converge. Drop these edges here,
+        # same as the under-connected edges already dropped above.
+        good_edges = np.linalg.norm(e_chord, axis=1) > 0
+        self.dV = self.dV[good_edges, :]
+        self.dC = self.dC[good_edges, :]
+        self.cell_pairs = self.cell_pairs[good_edges, :]
+        e_chord = e_chord[good_edges, :]
+
         self.involved_edges = -1 * np.ones(self.dC.shape[0], dtype=int)
 
         for i in range(len(self.edges)):
@@ -616,10 +633,6 @@ class VMSI():
         # initialise variables
         tau_1 = np.zeros((self.dV.shape[0], 2))
         tau_2 = np.zeros((self.dV.shape[0], 2))
-
-        v_coords = np.concatenate([self.vertices['coords'][self.involved_vertices].tolist()])
-
-        e_chord = np.matmul(self.dV, v_coords)
 
         e_cells = np.zeros((self.dV.shape[0], 2), dtype=int)
         r1 = np.zeros((self.dV.shape[0], 2))
