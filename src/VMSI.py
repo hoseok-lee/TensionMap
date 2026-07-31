@@ -541,7 +541,13 @@ class VMSI():
         # Build cell adjacency matrix
         adj_mat = np.zeros((len(self.involved_cells), len(self.involved_cells)))
         num_edges = 0
-        edge_cells = self.edges.cells.to_list()
+        # A genuine cell-cell edge always borders exactly 2 cells; some edges
+        # (segmentation noise, degenerate junctions) end up with 0/1/3+ due to
+        # np.intersect1d over noisy topology, so exclude those before building
+        # a uniform array - otherwise np.array() on a ragged list below raises
+        # "inhomogeneous shape".
+        edge_cells = [c for c in self.edges.cells.to_list() if len(c) == 2]
+        edge_cells = np.array(edge_cells) if len(edge_cells) > 0 else np.empty((0, 2))
 
         for i in range(len(self.involved_cells)):
             cell = self.involved_cells[i]
@@ -601,6 +607,9 @@ class VMSI():
 
         for i in range(len(self.edges)):
             edge_cells = self.edges.at[i, 'cells']
+            # Skip edges that don't border exactly 2 cells (see build_diff_operators)
+            if len(edge_cells) != 2:
+                continue
             idx = np.where((self.dC[:,np.where(edge_cells[0]==self.involved_cells)[0]] != 0) & (self.dC[:,np.where(edge_cells[1]==self.involved_cells)[0]] != 0))[0]
             self.involved_edges[idx] = i
 
@@ -1204,7 +1213,8 @@ class VMSI():
         for i in range(len(self.edges)):
             edge_cells = self.edges.at[i, 'cells']
 
-            if all(np.isin(edge_cells, self.involved_cells)) and np.isin(i, self.involved_edges):
+            # Skip edges that don't border exactly 2 cells (see build_diff_operators)
+            if len(edge_cells) == 2 and all(np.isin(edge_cells, self.involved_cells)) and np.isin(i, self.involved_edges):
                 cell_ind1 = np.where(self.involved_cells == edge_cells[0])[0]
                 cell_ind2 = np.where(self.involved_cells == edge_cells[1])[0]
 
