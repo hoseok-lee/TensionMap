@@ -920,6 +920,22 @@ class VMSI():
             q = x[:,0:2]
             p = x[:,2]
 
+            # theta_energy below derives arc curvature from the pressure
+            # difference between neighbouring cells (Young-Laplace), dividing
+            # by dP = p[a] - p[b] both in its value and in its gradient
+            # (radius_grad_theta). If two adjacent cells end up with exactly
+            # equal pressure here - e.g. weakly-constrained/isolated cells
+            # tied together by estimate_pressure's minimum-norm solution -
+            # that division is 0/0 = NaN, which nlopt's LD_LBFGS surfaces as
+            # a bare "runtime_error" with no message. p and theta are fixed
+            # (not optimised) during the theta step, so nudge any tied
+            # neighbouring pressures apart once, by a negligible amount, to
+            # avoid the exact singularity while leaving the physics
+            # (near-zero curvature in that limit) essentially unchanged.
+            tied = p[self.cell_pairs[:,0]] == p[self.cell_pairs[:,1]]
+            if np.any(tied):
+                p[self.cell_pairs[tied,0]] += 1e-8 * np.maximum(np.abs(p[self.cell_pairs[tied,0]]), 1.0)
+
             self.generate_circular_arcs()
 
             # Once q, p are optimised, perform initial optimisation for theta
