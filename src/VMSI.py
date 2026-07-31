@@ -8,7 +8,7 @@ import pandas as pd
 from skimage import measure, color
 from matplotlib import cm, patches, colors
 import matplotlib
-from src.segment import Segmenter
+from src.segment import Segmenter, set_array_at
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
 
@@ -332,7 +332,7 @@ class VMSI():
 
                     # change vertex with current index to negative vertex
                     self.vertices.at[v,'coords'] = rV2.tolist()
-                    self.vertices.at[v,'nverts'] = np.concatenate((nverts[neg_verts.astype('bool')], np.array([num_v])))
+                    set_array_at(self.vertices, v, 'nverts', np.concatenate((nverts[neg_verts.astype('bool')], np.array([num_v]))))
                     self.vertices.at[v,'fourfold'] = (np.shape(self.vertices['nverts'][v])[0] > 3)
 
                     neg_cells = ncells[[(sum(np.isin(nverts[neg_verts.astype('bool')], self.cells['nverts'][cell]))==2) for cell in ncells]]
@@ -349,7 +349,7 @@ class VMSI():
                                 'fourfold': False})
                         ], ignore_index=True)
                     self.vertices.at[num_v,'coords'] = rV1.tolist()
-                    self.vertices.at[num_v,'nverts'] = np.concatenate((nverts[pos_verts.astype('bool')], np.array([v])))
+                    set_array_at(self.vertices, num_v, 'nverts', np.concatenate((nverts[pos_verts.astype('bool')], np.array([v]))))
                     self.vertices.at[num_v,'fourfold'] = False
 
                     pos_cell = ncells[[(sum(np.isin(nverts[pos_verts.astype('bool')], self.cells['nverts'][cell]))==2) for cell in ncells]]
@@ -360,8 +360,8 @@ class VMSI():
 
                     joint_cells = ncells[np.invert(np.isin(ncells, np.concatenate([pos_cell, neg_cells])))]
 
-                    self.vertices.at[v,'ncells'] = np.concatenate((joint_cells, neg_cells))
-                    self.vertices.at[num_v,'ncells'] = np.concatenate((joint_cells, pos_cell))
+                    set_array_at(self.vertices, v, 'ncells', np.concatenate((joint_cells, neg_cells)))
+                    set_array_at(self.vertices, num_v, 'ncells', np.concatenate((joint_cells, pos_cell)))
 
                     # update current edges
                     # this requires edges to be in the same order as vertices
@@ -386,27 +386,27 @@ class VMSI():
                                 'tension': float(0)})
                         ], ignore_index=True)
                     self.edges.at[num_e,'verts'] = np.array([v, num_v])
-                    self.edges.at[num_e,'cells'] = joint_cells
+                    set_array_at(self.edges, num_e, 'cells', joint_cells)
                     self.edges.at[num_e,'pixels'] = np.array([])
                     self.edges.at[num_e,'radius'] = np.Inf
                     self.edges.at[num_e,'rho'] = np.array([np.Inf, np.Inf])
 
                     # update edges of new vertices
-                    self.vertices.at[v,'edges'] = np.concatenate((neg_edges, np.array([num_e])))
-                    self.vertices.at[num_v,'edges'] = np.concatenate((pos_edges, np.array([num_e])))
+                    set_array_at(self.vertices, v, 'edges', np.concatenate((neg_edges, np.array([num_e]))))
+                    set_array_at(self.vertices, num_v, 'edges', np.concatenate((pos_edges, np.array([num_e]))))
 
                     # update cells
 
                     # update pos cells
                     for cell in pos_cell:
                         self.cells.at[cell,'nverts'][self.cells['nverts'][cell] == v] = num_v
-                        self.cells.at[cell,'ncells'] = self.cells.at[cell, 'ncells'][np.isin(self.cells.at[cell,'ncells'], neg_cells, invert=True)]
+                        set_array_at(self.cells, cell, 'ncells', self.cells.at[cell, 'ncells'][np.isin(self.cells.at[cell,'ncells'], neg_cells, invert=True)])
                     # update neg cells
                     for cell in neg_cells:
-                        self.cells.at[cell,'ncells'] = self.cells.at[cell, 'ncells'][np.isin(self.cells.at[cell,'ncells'], pos_cell, invert=True)]
+                        set_array_at(self.cells, cell, 'ncells', self.cells.at[cell, 'ncells'][np.isin(self.cells.at[cell,'ncells'], pos_cell, invert=True)])
                     # update joint cells
                     for cell in joint_cells:
-                        self.cells.at[cell,'nverts'] = np.concatenate((self.cells.at[cell,'nverts'], np.array([num_v])))
+                        set_array_at(self.cells, cell, 'nverts', np.concatenate((self.cells.at[cell,'nverts'], np.array([num_v]))))
                         self.cells.at[cell,'numv'] = self.cells.at[cell,'numv']+1
         return
 

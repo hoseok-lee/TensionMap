@@ -12,6 +12,16 @@ from src.bwmorph import *
 import pandas as pd
 from scipy.spatial.distance import cdist
 
+def set_array_at(df, idx, col, arr):
+    """
+
+    Assign arr to df.at[idx, col] without pandas unboxing a length-1
+    np.ndarray into a 0-d array (df.at[idx, col] = arr does this silently),
+    which otherwise breaks later np.concatenate calls over that column.
+
+    """
+    df.loc[[idx], col] = pd.Series([arr], index=[idx])
+
 class VMSI_obj:
     def __init__(self):
         self.V_df = []
@@ -118,11 +128,7 @@ class Segmenter:
         for V in range(len(V_df)):
             for cell in V_df.at[V, 'ncells']:
                 C_df.at[cell, 'numv'] += 1
-                # Pandas' .at[] unboxes single-element np.ndarrays into 0-d arrays,
-                # which later breaks np.concatenate in make_convex(). Assigning via
-                # a single-entry Series avoids that unboxing and keeps nverts 1-D.
-                new_nverts = np.append(C_df.at[cell, 'nverts'], np.array([V]))
-                C_df.loc[[cell], 'nverts'] = pd.Series([new_nverts], index=[cell])
+                set_array_at(C_df, cell, 'nverts', np.append(C_df.at[cell, 'nverts'], np.array([V])))
 
         for C in range(len(C_df)):
             # If cell has no vertices, assume it must border the external cell only
@@ -400,12 +406,12 @@ class Segmenter:
             # --- update C_df ---
             obj.C_df.at[cell_idx, 'nverts'] = v_indices
             obj.C_df.at[cell_idx, 'numv']   = n_verts
-            obj.C_df.at[cell_idx, 'ncells'] = np.array([0])
+            set_array_at(obj.C_df, cell_idx, 'ncells', np.array([0]))
             obj.C_df.at[cell_idx, 'edges']  = np.arange(start_e, start_e + n_verts,
                                                           dtype=int)
 
-            obj.C_df.at[0, 'ncells'] = np.append(obj.C_df.at[0, 'ncells'], cell_idx)
-            obj.C_df.at[0, 'nverts'] = np.append(obj.C_df.at[0, 'nverts'], v_indices)
+            set_array_at(obj.C_df, 0, 'ncells', np.append(obj.C_df.at[0, 'ncells'], cell_idx))
+            set_array_at(obj.C_df, 0, 'nverts', np.append(obj.C_df.at[0, 'nverts'], v_indices))
 
         return obj
 
