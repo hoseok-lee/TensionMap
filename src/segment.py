@@ -118,7 +118,11 @@ class Segmenter:
         for V in range(len(V_df)):
             for cell in V_df.at[V, 'ncells']:
                 C_df.at[cell, 'numv'] += 1
-                C_df.at[cell, 'nverts'] = np.append(C_df.at[cell, 'nverts'], np.array([V]))
+                # Pandas' .at[] unboxes single-element np.ndarrays into 0-d arrays,
+                # which later breaks np.concatenate in make_convex(). Assigning via
+                # a single-entry Series avoids that unboxing and keeps nverts 1-D.
+                new_nverts = np.append(C_df.at[cell, 'nverts'], np.array([V]))
+                C_df.loc[[cell], 'nverts'] = pd.Series([new_nverts], index=[cell])
 
         for C in range(len(C_df)):
             # If cell has no vertices, assume it must border the external cell only
