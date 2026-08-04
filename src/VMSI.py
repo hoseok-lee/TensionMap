@@ -1038,20 +1038,31 @@ class VMSI():
             theta_opt.set_ftol_abs(1e-5)
             theta_opt.set_min_objective(theta_energy)
             theta_opt.add_inequality_mconstraint(theta_neqlincon, 1e-5*np.ones(self.dC.shape[0]))
-            # This was previously disabled due to NLopt generic failures, but
-            # those were caused by the NaN leaking out of radius_grad_theta's
-            # gradient (see the dR non-finite guard above) - with that fixed,
-            # this constraint is what pins theta's overall scale. Without it,
-            # theta is free to drift unboundedly along the null space of the
-            # inequality constraint alone, eventually overflowing to inf/nan,
-            # which is what was causing the runaway values at the tail of the
-            # theta optimisation (and poisoning the main minimisation that
-            # follows).
+            # This was previously disabled due to NLopt generic failures.
+            # Re-enabling it (once the NaN leak from radius_grad_theta's
+            # gradient was fixed - see the dR non-finite guard above) turned
+            # out not to change the optimisation trajectory at all for a
+            # single, non-tiled run: it only pins the scale of theta, and
+            # theta_neqlincon's own gradient already keeps that scale from
+            # drifting in practice. Kept for correctness (relevant once
+            # tiling recombines multiple fits), but it is not what was
+            # causing the inf/nan runaway below.
             theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
+            # theta itself has no bounds, unlike q/p above, so nothing stops
+            # the local LBFGS solver from pushing some theta difference
+            # toward an unconstrained direction until r_sq genuinely
+            # overflows float64 (inf), with a transitional inf-inf giving the
+            # nan seen right before it. Give theta generously wide bounds -
+            # far too loose to affect any real solution, but tight enough to
+            # hard-stop the runaway well before it reaches actual overflow.
+            theta_bound = 1e8
+            theta_opt.set_lower_bounds(-theta_bound * np.ones(theta0.size))
+            theta_opt.set_upper_bounds(theta_bound * np.ones(theta0.size))
             theta_opt.set_maxeval(2000)
 
             # Optimise
-            theta_opt.optimize(theta0)
+            # Nlopt can't handle initial values outside bounds so clip values before optimisation
+            theta_opt.optimize(np.clip(theta0, -theta_bound, theta_bound))
 
             theta = np.genfromtxt('.theta_opt.csv', delimiter=',')
             theta = np.array(theta)
