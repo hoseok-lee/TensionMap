@@ -897,6 +897,14 @@ class VMSI():
 
             # Configure optimiser
             local_opt = nlopt.opt(nlopt.LD_LBFGS, x0.size)
+            # AUGLAG delegates each penalised subproblem to this local optimiser.
+            # Without its own stopping criteria, a single (possibly
+            # ill-conditioned) inner LBFGS solve can run for a very long time
+            # before the outer AUGLAG loop's maxeval is even checked again -
+            # in practice indistinguishable from a hang. Give it explicit,
+            # bounded stopping criteria.
+            local_opt.set_ftol_rel(1e-6)
+            local_opt.set_maxeval(500)
             init_opt = nlopt.opt(nlopt.AUGLAG, x0.size)
             init_opt.set_local_optimizer(local_opt)
             init_opt.set_min_objective(energy)
@@ -952,8 +960,12 @@ class VMSI():
 
                 rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
                 r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
-                ind_z = r_sq<0
-                r_sq[r_sq<0] = 0
+                # r_sq<0 doesn't catch NaN (any comparison with NaN is False),
+                # so a stray NaN would otherwise pass straight through
+                # unclamped into sqrt() below. ~(r_sq>=0) treats NaN the same
+                # as a degenerate/negative discriminant.
+                ind_z = ~(r_sq>=0)
+                r_sq[ind_z] = 0
 
                 r = np.sqrt(r_sq)
 
@@ -970,6 +982,16 @@ class VMSI():
                     avg_d = np.sum(d, axis=1)
                     dR = radius_grad_theta(p[self.cell_pairs[:,0]], p[self.cell_pairs[:,1]], q[self.cell_pairs[:,0],0], q[self.cell_pairs[:,0],1], q[self.cell_pairs[:,1],0], q[self.cell_pairs[:,1],1], theta[self.cell_pairs[:,0]], theta[self.cell_pairs[:,1]])
                     dR[ind_z,:] = 0
+                    # radius_grad_theta recomputes the r_sq<0 discriminant
+                    # internally via a reciprocal-then-multiply (1/dP^2 * ...)
+                    # rather than the direct division used for r_sq/ind_z
+                    # above; near a r_sq=0 crossing these two paths can round
+                    # to opposite signs, so sqrt(negative) = NaN can slip
+                    # through the ind_z mask. Catch any leftover non-finite
+                    # entries directly - they correspond to the same
+                    # degenerate (near-zero-discriminant) edges ind_z already
+                    # intends to zero out.
+                    dR[~np.isfinite(dR)] = 0
 
                     dE = np.divide(-np.multiply(avg_d, dR.T).T,self.dC.shape[0])
                     rows = np.concatenate([self.cell_pairs[:,0], self.cell_pairs[:,1]])
@@ -1007,6 +1029,10 @@ class VMSI():
 
             # Configure optimiser
             theta_local_opt = nlopt.opt(nlopt.LD_LBFGS, theta0.size)
+            # See the analogous local_opt above: without its own stopping
+            # criteria this inner solve can run effectively forever.
+            theta_local_opt.set_ftol_rel(1e-6)
+            theta_local_opt.set_maxeval(500)
             theta_opt = nlopt.opt(nlopt.AUGLAG, theta0.size)
             theta_opt.set_local_optimizer(theta_local_opt)
             theta_opt.set_ftol_abs(1e-5)
@@ -1094,7 +1120,11 @@ class VMSI():
 
                 rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
                 r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
-                ind_z = r_sq<=0
+                # r_sq<=0 doesn't catch NaN (any comparison with NaN is
+                # False), so a stray NaN would otherwise pass straight
+                # through unclamped into sqrt() below. ~(r_sq>0) treats NaN
+                # the same as a degenerate/non-positive discriminant.
+                ind_z = ~(r_sq>0)
                 r_sq[ind_z] = 0
 
                 r = np.sqrt(r_sq)
@@ -1119,6 +1149,13 @@ class VMSI():
 
                     avg_d = np.sum(d, axis=1)
                     dR[ind_z] = 0
+                    # See the analogous guard in theta_energy: radius_grad
+                    # recomputes the r_sq<=0 discriminant via a
+                    # reciprocal-then-multiply, which can round to a
+                    # different sign than the direct division used for
+                    # r_sq/ind_z above right at a zero crossing, letting
+                    # sqrt(negative) = NaN slip past the ind_z mask.
+                    dR[~np.isfinite(dR)] = 0
 
                     dE = np.divide(np.multiply(dNormX, dRhoX.T).T+np.multiply(dNormY, dRhoY.T).T-np.multiply(avg_d, dR.T).T,self.dC.shape[0])
                     rows = np.concatenate([self.cell_pairs[:,0],self.cell_pairs[:,0]+self.dC.shape[1],self.cell_pairs[:,0]+2*self.dC.shape[1],self.cell_pairs[:,0]+3*self.dC.shape[1],
@@ -1170,6 +1207,10 @@ class VMSI():
                 return
 
             local_opt = nlopt.opt(nlopt.LD_LBFGS, X0.size)
+            # See the analogous local_opt in initial_minimization: without its
+            # own stopping criteria this inner solve can run effectively forever.
+            local_opt.set_ftol_rel(1e-6)
+            local_opt.set_maxeval(500)
 
             main_opt = nlopt.opt(nlopt.AUGLAG, X0.size)
             main_opt.set_local_optimizer(local_opt)
