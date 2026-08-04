@@ -930,19 +930,33 @@ class VMSI():
 
             # theta_energy below derives arc curvature from the pressure
             # difference between neighbouring cells (Young-Laplace), dividing
-            # by dP = p[a] - p[b] both in its value and in its gradient
-            # (radius_grad_theta). If two adjacent cells end up with exactly
-            # equal pressure here - e.g. weakly-constrained/isolated cells
-            # tied together by estimate_pressure's minimum-norm solution -
-            # that division is 0/0 = NaN, which nlopt's LD_LBFGS surfaces as
-            # a bare "runtime_error" with no message. p and theta are fixed
-            # (not optimised) during the theta step, so nudge any tied
-            # neighbouring pressures apart once, by a negligible amount, to
-            # avoid the exact singularity while leaving the physics
-            # (near-zero curvature in that limit) essentially unchanged.
-            tied = p[self.cell_pairs[:,0]] == p[self.cell_pairs[:,1]]
-            if np.any(tied):
-                p[self.cell_pairs[tied,0]] += 1e-8 * np.maximum(np.abs(p[self.cell_pairs[tied,0]]), 1.0)
+            # by dP = p[a] - p[b] (and 1/dP^2) both in its value and in its
+            # gradient (radius_grad_theta). p and theta are fixed (not
+            # optimised) during the theta step, so dP is constant for the
+            # whole run - if it's tiny for any pair, 1/dP^2 is a huge but
+            # finite constant from iteration 1. rho/r individually become
+            # enormous while dMag-r can still look numerically reasonable for
+            # a long time (the optimisation "rides along" on well-behaved-
+            # looking energy values), until floating-point precision finally
+            # breaks down and it overflows to inf/nan - which is what was
+            # producing the runaway after ~2000 iterations, not theta itself
+            # drifting (its bounds above never actually engage).
+            # A minimum-separation floor only catching *exact* ties (as a
+            # narrower version of this fix once did) misses pairs that are
+            # merely very close but not bit-identical, which cause the same
+            # blow-up. Enforce a floor on |dP| for every neighbouring pair,
+            # not just exact ties: 1e-2 is ~5 orders of magnitude below the
+            # pressure bounds used elsewhere (p in [0.001, 2000]), so it's
+            # far too small to distort any genuine physical difference, but
+            # keeps 1/dP^2 <= 1e4 - safely finite through further matmuls.
+            min_dp = 1e-2
+            dP0 = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+            too_close = np.abs(dP0) < min_dp
+            if np.any(too_close):
+                sign = np.where(dP0[too_close] >= 0, 1.0, -1.0)
+                shortfall = min_dp - np.abs(dP0[too_close])
+                p[self.cell_pairs[too_close,0]] += sign * shortfall / 2
+                p[self.cell_pairs[too_close,1]] -= sign * shortfall / 2
 
             self.generate_circular_arcs()
 
