@@ -1038,9 +1038,16 @@ class VMSI():
             theta_opt.set_ftol_abs(1e-5)
             theta_opt.set_min_objective(theta_energy)
             theta_opt.add_inequality_mconstraint(theta_neqlincon, 1e-5*np.ones(self.dC.shape[0]))
-            # Having trouble with NLopt generic failures so disable equality constraint for now
-            # This shouldn't matter since it's only setting the scale which we change during tiling anyway
-    #        theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
+            # This was previously disabled due to NLopt generic failures, but
+            # those were caused by the NaN leaking out of radius_grad_theta's
+            # gradient (see the dR non-finite guard above) - with that fixed,
+            # this constraint is what pins theta's overall scale. Without it,
+            # theta is free to drift unboundedly along the null space of the
+            # inequality constraint alone, eventually overflowing to inf/nan,
+            # which is what was causing the runaway values at the tail of the
+            # theta optimisation (and poisoning the main minimisation that
+            # follows).
+            theta_opt.add_equality_constraint(theta_eqlincon, 1e-5)
             theta_opt.set_maxeval(2000)
 
             # Optimise
