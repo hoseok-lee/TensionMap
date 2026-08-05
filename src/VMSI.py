@@ -958,6 +958,16 @@ class VMSI():
                 p[self.cell_pairs[too_close,0]] += sign * shortfall / 2
                 p[self.cell_pairs[too_close,1]] -= sign * shortfall / 2
 
+            if self.verbose:
+                dQ_diag = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
+                QL_diag = np.sum(np.power(dQ_diag, 2), axis=1)
+                print(f"[diag] cell_pairs: {len(dP0)}, min|dP|: {np.min(np.abs(dP0)):.6g}, "
+                      f"pairs<min_dp: {int(np.sum(too_close))}, "
+                      f"p range: [{np.min(p):.6g}, {np.max(p):.6g}], "
+                      f"q finite: {np.all(np.isfinite(q))}, p finite: {np.all(np.isfinite(p))}, "
+                      f"QL range: [{np.min(QL_diag):.6g}, {np.max(QL_diag):.6g}], "
+                      f"QL==0 count: {int(np.sum(QL_diag == 0))}")
+
             self.generate_circular_arcs()
 
             # Once q, p are optimised, perform initial optimisation for theta
