@@ -961,12 +961,22 @@ class VMSI():
             if self.verbose:
                 dQ_diag = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL_diag = np.sum(np.power(dQ_diag, 2), axis=1)
+                # Cells whose only real neighbour is the exterior/background
+                # cell (0) contribute no real constraint to estimate_pressure's
+                # L1/L2 system, so its minimum-norm lstsq solution tends to
+                # pull them all toward the same value - the likely source of
+                # the mass pressure-tying seen above.
+                isolated_count = sum(
+                    1 for i in range(1, len(self.cells))
+                    if np.array_equal(np.unique(np.atleast_1d(self.cells.at[i, 'ncells'])), np.array([0]))
+                )
                 print(f"[diag] cell_pairs: {len(dP0)}, min|dP|: {np.min(np.abs(dP0)):.6g}, "
                       f"pairs<min_dp: {int(np.sum(too_close))}, "
                       f"p range: [{np.min(p):.6g}, {np.max(p):.6g}], "
                       f"q finite: {np.all(np.isfinite(q))}, p finite: {np.all(np.isfinite(p))}, "
                       f"QL range: [{np.min(QL_diag):.6g}, {np.max(QL_diag):.6g}], "
-                      f"QL==0 count: {int(np.sum(QL_diag == 0))}")
+                      f"QL==0 count: {int(np.sum(QL_diag == 0))}, "
+                      f"isolated cells (only neighbour is exterior): {isolated_count} / {len(self.cells)-1}")
 
             self.generate_circular_arcs()
 
