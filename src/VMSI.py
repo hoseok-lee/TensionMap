@@ -80,6 +80,13 @@ def radius_grad_theta(p1,p2,q1x,q1y,q2x,q2y,t1,t2):
 
     """
     t4 = p1-p2
+    # For a relatively homogeneous tissue, neighbouring cells can genuinely
+    # have near-identical pressure (dP -> 0 is the physical straight-edge /
+    # infinite-radius limit, not an error). Dividing by t4/t4^2 below is
+    # singular exactly there, so clamp its magnitude away from zero - kept
+    # in sync with the same floor used in initial_minimization/fit.
+    _min_dp = 1e-2
+    t4 = np.where(t4 >= 0, np.maximum(t4, _min_dp), np.minimum(t4, -_min_dp))
     t5 = q1x-q2x
     t6 = q1y-q2y
     t7 = np.divide(1,np.power(t4,2))
@@ -154,6 +161,12 @@ def radius_grad(p1,p2,q1x,q1y,q2x,q2y,t1,t2):
 
     """
     t4 = p1-p2
+    # See the analogous clamp in radius_grad_theta: dP -> 0 is a genuine
+    # physical limit (near-uniform pressure / straight edge) for a
+    # relatively homogeneous tissue, not an error - clamp away from the
+    # singularity at t4=0 instead of dividing by it directly.
+    _min_dp = 1e-2
+    t4 = np.where(t4 >= 0, np.maximum(t4, _min_dp), np.minimum(t4, -_min_dp))
     t5 = q1x-q2x
     t6 = q1y-q2y
     t7 = np.divide(1,np.power(t4,2))
@@ -931,52 +944,30 @@ class VMSI():
             # theta_energy below derives arc curvature from the pressure
             # difference between neighbouring cells (Young-Laplace), dividing
             # by dP = p[a] - p[b] (and 1/dP^2) both in its value and in its
-            # gradient (radius_grad_theta). p and theta are fixed (not
-            # optimised) during the theta step, so dP is constant for the
-            # whole run - if it's tiny for any pair, 1/dP^2 is a huge but
-            # finite constant from iteration 1. rho/r individually become
-            # enormous while dMag-r can still look numerically reasonable for
-            # a long time (the optimisation "rides along" on well-behaved-
-            # looking energy values), until floating-point precision finally
-            # breaks down and it overflows to inf/nan - which is what was
-            # producing the runaway after ~2000 iterations, not theta itself
-            # drifting (its bounds above never actually engage).
-            # A minimum-separation floor only catching *exact* ties (as a
-            # narrower version of this fix once did) misses pairs that are
-            # merely very close but not bit-identical, which cause the same
-            # blow-up. Enforce a floor on |dP| for every neighbouring pair,
-            # not just exact ties: 1e-2 is ~5 orders of magnitude below the
-            # pressure bounds used elsewhere (p in [0.001, 2000]), so it's
-            # far too small to distort any genuine physical difference, but
-            # keeps 1/dP^2 <= 1e4 - safely finite through further matmuls.
+            # gradient (radius_grad_theta). For a relatively homogeneous
+            # tissue it's physically normal for most neighbouring cells to
+            # have very similar pressure - that's not a data defect, it's
+            # dP -> 0 approaching the correct straight-edge (infinite
+            # radius) limit. The bug is that this formulation divides by dP
+            # directly instead of handling that limit gracefully. Rather than
+            # trying to nudge p apart (which doesn't scale: with pressure
+            # this uniform, most cells sit in multiple too-close pairs at
+            # once, so a single vectorised pass silently drops all but the
+            # last correction per cell - confirmed by diagnostics showing the
+            # fix had no effect), dP is now clamped at the point of use in
+            # theta_energy and inside radius_grad_theta/radius_grad
+            # themselves (see below), which is conflict-free by construction.
             min_dp = 1e-2
-            dP0 = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
-            too_close = np.abs(dP0) < min_dp
-            if np.any(too_close):
-                sign = np.where(dP0[too_close] >= 0, 1.0, -1.0)
-                shortfall = min_dp - np.abs(dP0[too_close])
-                p[self.cell_pairs[too_close,0]] += sign * shortfall / 2
-                p[self.cell_pairs[too_close,1]] -= sign * shortfall / 2
 
             if self.verbose:
+                dP_diag = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
                 dQ_diag = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL_diag = np.sum(np.power(dQ_diag, 2), axis=1)
-                # Cells whose only real neighbour is the exterior/background
-                # cell (0) contribute no real constraint to estimate_pressure's
-                # L1/L2 system, so its minimum-norm lstsq solution tends to
-                # pull them all toward the same value - the likely source of
-                # the mass pressure-tying seen above.
-                isolated_count = sum(
-                    1 for i in range(1, len(self.cells))
-                    if np.array_equal(np.unique(np.atleast_1d(self.cells.at[i, 'ncells'])), np.array([0]))
-                )
-                print(f"[diag] cell_pairs: {len(dP0)}, min|dP|: {np.min(np.abs(dP0)):.6g}, "
-                      f"pairs<min_dp: {int(np.sum(too_close))}, "
+                print(f"[diag] cell_pairs: {len(dP_diag)}, min|dP|: {np.min(np.abs(dP_diag)):.6g}, "
+                      f"pairs<min_dp: {int(np.sum(np.abs(dP_diag) < min_dp))}, "
                       f"p range: [{np.min(p):.6g}, {np.max(p):.6g}], "
                       f"q finite: {np.all(np.isfinite(q))}, p finite: {np.all(np.isfinite(p))}, "
-                      f"QL range: [{np.min(QL_diag):.6g}, {np.max(QL_diag):.6g}], "
-                      f"QL==0 count: {int(np.sum(QL_diag == 0))}, "
-                      f"isolated cells (only neighbour is exterior): {isolated_count} / {len(self.cells)-1}")
+                      f"QL range: [{np.min(QL_diag):.6g}, {np.max(QL_diag):.6g}]")
 
             self.generate_circular_arcs()
 
@@ -988,6 +979,10 @@ class VMSI():
                 np.savetxt('./.theta_opt.csv', theta, delimiter=',',fmt='%f')
 
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+                # Clamp away from the dP=0 singularity (see comment above
+                # this function's setup) - kept consistent with the same
+                # clamp applied inside radius_grad_theta's gradient below.
+                dP = np.where(dP >= 0, np.maximum(dP, min_dp), np.minimum(dP, -min_dp))
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
@@ -1157,6 +1152,10 @@ class VMSI():
 
         if self.optimiser == 'nlopt':
             import nlopt
+            # See the matching clamp/comment in initial_minimization's
+            # theta_energy - same floor, kept consistent so both stages
+            # regularise the dP=0 singularity the same way.
+            min_dp = 1e-2
             def objective(X, grad=np.array([])):
                 np.savetxt('./.main_opt.csv', X, delimiter=',',fmt='%f')
                 X = X.reshape(X0.shape, order='F')
@@ -1166,6 +1165,12 @@ class VMSI():
                 theta = X[:,2]
 
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+                # Clamp away from the dP=0 singularity - dP is a live
+                # optimisation variable here (unlike in theta_energy), so
+                # this also protects against the solver transiently passing
+                # through near-equal-pressure configurations mid-search. Kept
+                # consistent with the same clamp in radius_grad's gradient.
+                dP = np.where(dP >= 0, np.maximum(dP, min_dp), np.minimum(dP, -min_dp))
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
                 dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
                 QL = np.sum(np.power(dQ, 2), axis=1)
