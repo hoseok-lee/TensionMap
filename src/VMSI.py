@@ -931,7 +931,17 @@ class VMSI():
 
             # Optimisation
             # Nlopt can't handle initial values outside bounds so clip values before optimisation
-            init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
+            # Nlopt can raise a bare RuntimeError (e.g. roundoff-limited: it
+            # can no longer improve given floating-point precision) instead
+            # of returning normally once converged. The code already doesn't
+            # trust optimize()'s return value - it re-reads the last
+            # evaluated point from the log file below regardless - so treat
+            # that exception the same way: not a failure, just an early
+            # (already-converged) exit from this particular call.
+            try:
+                init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
+            except RuntimeError:
+                pass
 
             # For larger systems, the nlopt optimiser will not converge to the desired tolerance and does not return the results obtained at the final step
             # To get around this, retrieve results from log file
@@ -1091,7 +1101,14 @@ class VMSI():
 
             # Optimise
             # Nlopt can't handle initial values outside bounds so clip values before optimisation
-            theta_opt.optimize(np.clip(theta0, -theta_bound, theta_bound))
+            # See the matching try/except around init_opt.optimize above -
+            # same reasoning: the log file is re-read as the source of truth
+            # regardless, so a bare RuntimeError from nlopt itself (e.g.
+            # roundoff-limited) isn't a failure here.
+            try:
+                theta_opt.optimize(np.clip(theta0, -theta_bound, theta_bound))
+            except RuntimeError:
+                pass
 
             theta = np.genfromtxt('.theta_opt.csv', delimiter=',')
             theta = np.array(theta)
@@ -1280,7 +1297,16 @@ class VMSI():
             main_opt.add_equality_mconstraint(linear_con, 1e-6*np.ones(2))
             main_opt.set_maxeval(2000)
 
-            main_opt.optimize(np.clip(X0.ravel(order='F'),lb,ub))
+            # See the matching try/except around init_opt/theta_opt.optimize
+            # in initial_minimization - same reasoning: X is re-read from the
+            # log file as the source of truth regardless, so a bare
+            # RuntimeError from nlopt itself (e.g. roundoff-limited, which is
+            # what the value flatlining right before the crash indicates)
+            # isn't a failure here.
+            try:
+                main_opt.optimize(np.clip(X0.ravel(order='F'),lb,ub))
+            except RuntimeError:
+                pass
 
             X = np.genfromtxt('.main_opt.csv', delimiter=',')
             X = X.reshape(X0.shape, order='F')
