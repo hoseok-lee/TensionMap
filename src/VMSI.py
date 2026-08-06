@@ -938,9 +938,14 @@ class VMSI():
             # evaluated point from the log file below regardless - so treat
             # that exception the same way: not a failure, just an early
             # (already-converged) exit from this particular call.
+            # nlopt's own exception class (its C++ std::runtime_error,
+            # exposed as a plain lowercase "runtime_error" type) isn't a
+            # subclass of Python's builtin RuntimeError, so catch broadly -
+            # any exception here means "stop trying to optimize further",
+            # which is exactly what the CSV re-read below already assumes.
             try:
                 init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
-            except RuntimeError:
+            except Exception:
                 pass
 
             # For larger systems, the nlopt optimiser will not converge to the desired tolerance and does not return the results obtained at the final step
@@ -1102,12 +1107,11 @@ class VMSI():
             # Optimise
             # Nlopt can't handle initial values outside bounds so clip values before optimisation
             # See the matching try/except around init_opt.optimize above -
-            # same reasoning: the log file is re-read as the source of truth
-            # regardless, so a bare RuntimeError from nlopt itself (e.g.
-            # roundoff-limited) isn't a failure here.
+            # same reasoning, and same broad Exception catch since nlopt's
+            # own exception class isn't a Python RuntimeError subclass.
             try:
                 theta_opt.optimize(np.clip(theta0, -theta_bound, theta_bound))
-            except RuntimeError:
+            except Exception:
                 pass
 
             theta = np.genfromtxt('.theta_opt.csv', delimiter=',')
@@ -1299,13 +1303,15 @@ class VMSI():
 
             # See the matching try/except around init_opt/theta_opt.optimize
             # in initial_minimization - same reasoning: X is re-read from the
-            # log file as the source of truth regardless, so a bare
-            # RuntimeError from nlopt itself (e.g. roundoff-limited, which is
-            # what the value flatlining right before the crash indicates)
-            # isn't a failure here.
+            # log file as the source of truth regardless, so an exception
+            # from nlopt itself (e.g. roundoff-limited, which is what the
+            # value flatlining right before the crash indicates) isn't a
+            # failure here. Caught broadly since nlopt's own exception class
+            # isn't a Python RuntimeError subclass (confirmed by this exact
+            # crash escaping a narrower `except RuntimeError`).
             try:
                 main_opt.optimize(np.clip(X0.ravel(order='F'),lb,ub))
-            except RuntimeError:
+            except Exception:
                 pass
 
             X = np.genfromtxt('.main_opt.csv', delimiter=',')
