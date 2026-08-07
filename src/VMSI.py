@@ -1448,9 +1448,14 @@ class VMSI():
             else:
                 ind = np.array([])
 
-            if ind.size>0 and self.edges.at[int(ind), 'tension'].size>0:
-                T[e] = self.edges.at[int(ind), 'tension']
-                i1[e] = int(ind)
+            # ind can contain more than one match if two edges happen to
+            # share the same vertex pair (e.g. duplicate/synthetic edges
+            # from isolated-cell topology injection or vertex splitting) -
+            # int(ind) would then raise "only length-1 arrays can be
+            # converted to Python scalars". Just take the first match.
+            if ind.size>0 and self.edges.at[int(ind[0]), 'tension'].size>0:
+                T[e] = self.edges.at[int(ind[0]), 'tension']
+                i1[e] = int(ind[0])
             else:
                 T[e] = 1
 
