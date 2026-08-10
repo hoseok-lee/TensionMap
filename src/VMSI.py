@@ -198,7 +198,8 @@ def radius_grad(p1,p2,q1x,q1y,q2x,q2y,t1,t2):
 
 class VMSI():
 
-    def __init__(self, vertices, cells, edges, width, height, verbose, optimiser='nlopt'):
+    def __init__(self, vertices, cells, edges, width, height, verbose, optimiser='nlopt', mask=None,
+                 isolated_tension=1.0, isolated_background_pressure=0.0):
         self.vertices = vertices
         self.cells = cells
         self.edges = edges
@@ -206,6 +207,16 @@ class VMSI():
         self.height = height
         self.verbose = verbose
         self.optimiser = optimiser
+        # Relabelled mask (as returned by Segmenter.process_segmented_image),
+        # where a cell's C_df row index equals its label in this mask - same
+        # convention already used by inject_isolated_cell_topology. Optional
+        # and only used by infer_isolated_cells() to fit a circle to an
+        # isolated cell's true contour; kept None by default (e.g. tiling)
+        # since callers that don't have this mask handy still work, just
+        # falling back to the older synthetic-edge-based estimate.
+        self.mask = mask
+        self.isolated_tension = isolated_tension
+        self.isolated_background_pressure = isolated_background_pressure
 
         # Mark fourfold vertices
         self.vertices['fourfold'] = [(np.shape(nverts)[0] != 3) for nverts in self.vertices['nverts']]
@@ -220,6 +231,9 @@ class VMSI():
         self.cells['qy'] = np.zeros(len(self.cells))
         self.cells['theta'] = np.zeros(len(self.cells))
         self.cells['stress'] = [np.array([0,0,0]) for _ in range(self.cells.shape[0])]
+        # Only meaningful for isolated cells (see infer_isolated_cells) - NaN
+        # for normal cells that go through the main vertex-network fit.
+        self.cells['circularity'] = np.full(len(self.cells), np.nan)
 
         # Initialize attributes
         self.dV = None
@@ -1387,23 +1401,42 @@ class VMSI():
     def return_pressures(self):
         return self.cells.pressure.values[1:]
 
-    def infer_isolated_cells(self, background_pressure=0.0):
+    def infer_isolated_cells(self, background_pressure=None, tension=None):
         """
-        Directly infer tension and pressure for cells that touch only the
-        background (cell 0) — i.e. suspended / isolated cells.
+        Directly infer pressure (and a representative tension) for cells that
+        touch only the background (cell 0) — i.e. suspended / isolated cells
+        with no real neighbours to jointly solve tension/pressure against.
 
-        Uses Young-Laplace arc-by-arc: T_i = delta_p * R_i, where R_i is the
-        radius of curvature of the i-th membrane arc fitted by fit_circle().
-        delta_p (= p_cell - p_background) is normalised to 1 to match the
-        relative-pressure convention used by the main VMSI fit.
+        A genuinely isolated cell's boundary curvature only constrains the
+        ratio of its pressure difference from the background to its own
+        interfacial tension (delta_p = tension * curvature) - not each
+        independently, since there's no cell-cell junction network to
+        resolve them jointly (see run_isolated_cells for the full derivation
+        and rationale for this convention). This assumes a fixed, uniform
+        interfacial tension across all isolated cells and solves for each
+        cell's relative pressure from how tightly curved its own full
+        contour is: delta_p = tension / R, fit with a single circle to the
+        cell's whole boundary (self.mask, if available) rather than the
+        piecewise arcs used elsewhere in the main VMSI fit - a single clean
+        fit to the true contour is more robust than stitching together
+        several short, noisy synthetic-edge arcs around the same shape.
 
-        For straight arcs (R = inf) the tension is set to zero, indicating the
-        arc provides no curvature information.
+        If self.mask isn't available (e.g. constructed without one), falls
+        back to the coarser synthetic-edge/fit_circle-based radius already
+        computed elsewhere in the pipeline, using the same delta_p=tension
+        convention.
 
-        :param background_pressure: reference pressure to assign to cell 0.
-                                    Default 0.0 (relative scale).
+        :param background_pressure: reference pressure assigned to cell 0. Defaults to
+                                    self.isolated_background_pressure (set at construction).
+        :param tension: assumed uniform interfacial tension for every isolated cell (arbitrary
+                        units unless independently measured). Defaults to self.isolated_tension.
         :return: list of cell indices that were processed.
         """
+        if background_pressure is None:
+            background_pressure = self.isolated_background_pressure
+        if tension is None:
+            tension = self.isolated_tension
+
         isolated = [
             c for c in range(1, len(self.cells))
             if (len(self.cells.at[c, 'ncells']) == 1
@@ -1411,19 +1444,28 @@ class VMSI():
         ]
 
         for cell_idx in isolated:
+            radius = np.inf
+            circularity = np.nan
+
+            if self.mask is not None:
+                cell_mask = (self.mask == cell_idx).astype(float)
+                contours = measure.find_contours(cell_mask, 0.5)
+                if contours:
+                    contour = max(contours, key=len)
+                    contour_xy = contour[:, ::-1]
+                    _, radius, circularity = _fit_circle_to_contour(contour_xy)
+
+            pressure = background_pressure + (tension / radius if np.isfinite(radius) and radius > 0 else 0.0)
+            self.cells.at[cell_idx, 'pressure'] = pressure
+            self.cells.at[cell_idx, 'circularity'] = circularity
+
             cell_edges = self.cells.at[cell_idx, 'edges']
-            if not hasattr(cell_edges, '__len__') or len(cell_edges) == 0:
-                continue
-            cell_edges = np.array(cell_edges, dtype=int)
-            cell_edges = cell_edges[cell_edges >= 0]
-
-            # Normalise so delta_p = 1 (same convention as main VMSI fit)
-            delta_p = 1.0
-            self.cells.at[cell_idx, 'pressure'] = background_pressure + delta_p
-
-            for e in cell_edges:
-                r = self.edges.at[e, 'radius']
-                self.edges.at[e, 'tension'] = delta_p * r if np.isfinite(r) else 0.0
+            if hasattr(cell_edges, '__len__') and len(cell_edges) > 0:
+                cell_edges = np.array(cell_edges, dtype=int)
+                cell_edges = cell_edges[cell_edges >= 0]
+                for e in cell_edges:
+                    r = self.edges.at[e, 'radius'] if not np.isfinite(radius) else radius
+                    self.edges.at[e, 'tension'] = tension if np.isfinite(r) else 0.0
 
         return isolated
 
@@ -1768,9 +1810,22 @@ class VMSI():
         else:
             return False
 
-def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile=150, verbose=False, overlap=0.3, optimiser='nlopt'):
+def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
+             optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0):
     """
     Main function to run stress inference in a single step.
+
+    Cells with no real neighbours (only touching the background) are handled
+    via infer_isolated_cells - their pressure is inferred directly from their
+    own boundary curvature (Young-Laplace, assuming uniform interfacial
+    tension across cells - see infer_isolated_cells/run_isolated_cells for
+    the full rationale), rather than through the main vertex-network fit,
+    since a genuinely isolated cell has no shared junctions to jointly solve
+    tension/pressure against. If *no* cell in the image has any real
+    neighbour at all (a fully non-confluent/dispersed segmentation), there is
+    no vertex-network topology whatsoever to build - this function detects
+    that case and falls back entirely to run_isolated_cells(), which returns
+    a plain DataFrame instead of a VMSI object (see below).
 
     :param verbose: (bool) whether to provide detailed output. Default:False.
     :param img: (numpy array) segmented image.
@@ -1779,8 +1834,15 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
     :param tile: (bool) whether to break image into tiles for faster inference. Not recommended for images with tissue-scale anisotropy. Default: False.
     :param overlap: (float) fraction of overlap between tiles. Default: 0.3.
     :param optimiser: (str) which optimiser to use. Currently available options are 'nlopt' (default) , 'matlab'.
+    :param isolated_tension: (float) assumed uniform interfacial tension used to infer pressure for any
+                             isolated cells (arbitrary units unless independently measured). Default: 1.0.
+    :param isolated_background_pressure: (float) reference pressure assigned to the background for isolated
+                                          cells' Young-Laplace inference. Default: 0.0.
 
-    :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology metrics.
+    :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology
+             metrics - UNLESS the image is fully non-confluent (no cell has any real neighbour), in which case
+             a pandas DataFrame is returned instead (see run_isolated_cells), since there is no vertex/edge
+             network to attach to a VMSI object at all.
     """
 
     warnings.filterwarnings('ignore')
@@ -1860,16 +1922,132 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
 
         model = merge_models(models, p_scale, t_scale, offset, img, verbose=verbose, holes_mask=holes_mask)
     else:
-        # process segmented image for input into VMSI
-        seg = Segmenter(masks=img, labelled=is_labelled)
-        VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=holes_mask)
+        try:
+            # process segmented image for input into VMSI
+            seg = Segmenter(masks=img, labelled=is_labelled)
+            VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=holes_mask)
+        except ValueError as err:
+            # Raised by Segmenter.find_vertices when the mask has no
+            # triple-junction vertices anywhere - i.e. no cell touches any
+            # other cell. There's no vertex-network topology to build at
+            # all, so fall back to the standalone per-cell Laplace-pressure
+            # method entirely instead of propagating the error.
+            if "No triple-junction vertices found" not in str(err):
+                raise
+            if verbose:
+                print("No cell-cell junctions found in this mask; falling back to "
+                      "run_isolated_cells (per-cell Young-Laplace pressure inference).")
+            return run_isolated_cells(img, is_labelled=True, background_pressure=isolated_background_pressure,
+                                       tension=isolated_tension, verbose=verbose)
         # create the model
-        model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=img.shape[0], width=img.shape[1], verbose=verbose, optimiser=optimiser)
+        model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=img.shape[0], width=img.shape[1],
+                      verbose=verbose, optimiser=optimiser, mask=labelled_mask,
+                      isolated_tension=isolated_tension, isolated_background_pressure=isolated_background_pressure)
         # fit the model parameters
         model.fit()
         # compute stress tensor
         model.compute_stresstensor()
     return model
+
+def _fit_circle_to_contour(contour_xy):
+    """
+
+    Algebraic (Kasa) least-squares circle fit to a closed set of 2D points.
+    Unlike VMSI.fit_circle (which fits an arc between two known vertex
+    endpoints), this fits a circle to an entire closed contour with no
+    endpoints, which is what a spatially-isolated cell's own boundary is.
+
+    :param contour_xy: (N,2) array of (x,y) boundary coordinates.
+    :return: (centre (2,), radius (float), circularity (float)) - circularity
+             is the coefficient of variation of point-to-centre distances
+             (0 = perfect circle, larger = less circular / less reliable fit).
+
+    """
+    x = contour_xy[:, 0]
+    y = contour_xy[:, 1]
+
+    A = np.column_stack([2*x, 2*y, np.ones_like(x)])
+    b = x**2 + y**2
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    cx, cy, c = sol
+    r_sq = c + cx**2 + cy**2
+
+    if r_sq <= 0:
+        return np.array([cx, cy]), np.inf, np.inf
+
+    radius = np.sqrt(r_sq)
+    dists = np.sqrt((x - cx)**2 + (y - cy)**2)
+    circularity = np.std(dists) / np.mean(dists) if np.mean(dists) > 0 else np.inf
+
+    return np.array([cx, cy]), radius, circularity
+
+def run_isolated_cells(img, is_labelled=False, background_pressure=0.0, tension=1.0, verbose=False):
+    """
+
+    Infer relative cell pressure for a segmentation with no shared cell-cell
+    topology at all (e.g. spatially separated / dispersed cells), by applying
+    Young-Laplace's law directly to each cell's own boundary shape.
+
+    This is a fundamentally different, much weaker measurement than run_VMSI:
+    a genuinely isolated cell's boundary curvature only constrains the ratio
+    of its pressure difference (from the surrounding medium) to its own
+    interfacial tension (delta_p = tension * curvature) - not each
+    independently. There is no cell-cell junction network to jointly solve
+    for both, unlike in a confluent tissue. This assumes interfacial tension
+    is the same for every cell (a modelling choice, not something measured -
+    see the fit_circle-based derivation in VMSI.infer_isolated_cells for the
+    background), and infers each cell's *relative* pressure from how tightly
+    curved (circular) its own boundary is. It intentionally bypasses all of
+    VMSI's vertex/edge topology construction and nonlinear optimisation,
+    since none of that machinery applies when cells share no boundaries.
+
+    :param img: (numpy array) segmented image.
+    :param is_labelled: (bool) whether cells are already labelled. Default: False.
+    :param background_pressure: (float) reference pressure assigned to the surrounding medium. Default: 0.0.
+    :param tension: (float) assumed uniform interfacial tension for every cell, in arbitrary units unless
+                    independently measured - only relative pressures between cells are meaningful. Default: 1.0.
+    :param verbose: (bool) print progress. Default: False.
+
+    :return: pandas DataFrame with one row per cell: label, centroid, area, radius, circularity, pressure.
+             circularity is the coefficient of variation of the fitted circle's residuals - high values mean
+             the cell's shape is a poor match for a single circular arc, so its inferred pressure should be
+             treated with more caution.
+
+    """
+    if not is_labelled:
+        img = measure.label(img)
+
+    labels = np.unique(img)
+    labels = labels[labels != 0]
+
+    rows = []
+    for label in labels:
+        cell_mask = (img == label).astype(float)
+        contours = measure.find_contours(cell_mask, 0.5)
+        if not contours:
+            continue
+        contour = max(contours, key=len)
+        contour_xy = contour[:, ::-1]
+
+        centre, radius, circularity = _fit_circle_to_contour(contour_xy)
+        pressure = background_pressure + (tension / radius if np.isfinite(radius) and radius > 0 else np.nan)
+
+        props = measure.regionprops((img == label).astype(int))[0]
+
+        rows.append({
+            'label': label,
+            'centroid_x': props.centroid[1],
+            'centroid_y': props.centroid[0],
+            'area': props.area,
+            'radius': radius,
+            'circularity': circularity,
+            'pressure': pressure,
+        })
+
+        if verbose:
+            print(f"cell {label}: radius={radius:.3g}, circularity={circularity:.3g}, pressure={pressure:.3g}")
+
+    return pd.DataFrame(rows)
 
 def create_image_tiles(img, holes_mask, cells_per_tile=150, overlap=0.3):
     """

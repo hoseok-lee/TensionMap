@@ -99,6 +99,18 @@ class Segmenter:
         branchpoints = self.find_branch_points(mask==0)
 
         cc = measure.label(branchpoints, connectivity=2)
+        if cc.max() == 0:
+            raise ValueError(
+                "No triple-junction vertices found in this mask's background "
+                "skeleton. VMSI's vertex model requires a confluent, "
+                "space-filling tissue segmentation (cells touching along "
+                "shared edges); it can't infer anything from a mask where "
+                "cells are separated by background - there are no cell-cell "
+                "junctions to analyse. If these gaps are a segmentation "
+                "artifact (cells that should be adjacent but have thin gaps "
+                "between them), close them first, e.g. with "
+                "skimage.segmentation.expand_labels."
+            )
         v = np.array([np.flip(np.round(regionprops.centroid).astype(int)) for regionprops in measure.regionprops(cc)])
         a = np.array([regionprops.coords for regionprops in measure.regionprops(cc)])
         # regionprops returns the coordinates in numpy indexing rather than cartesian indexing - e.g.
