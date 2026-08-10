@@ -630,6 +630,17 @@ class VMSI():
         self.dV = self.dV[bad_edges,:]
         self.dC = self.dC[bad_edges,:]
         self.cell_pairs = self.cell_pairs[bad_edges,:]
+
+        if self.dV.shape[0] == 0 or len(self.involved_vertices) == 0:
+            raise ValueError(
+                "No usable edges or vertices remain after filtering in build_diff_operators - "
+                "classify_cells found some cells that aren't directly touching the background, but "
+                "none of them form a well-constrained enough local network (e.g. edges shared by "
+                "exactly 2 real cells, vertices with enough incident edges) for the main vertex-network "
+                "inference. This is the same underlying issue as having no bulk cells at all - a mask "
+                "made of small touching clusters with no genuinely confluent interior. Use "
+                "run_isolated_cells (or run_VMSI, which falls back to it automatically) instead."
+            )
         return
 
 
@@ -1963,16 +1974,24 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
 
         model = merge_models(models, p_scale, t_scale, offset, img, verbose=verbose, holes_mask=holes_mask)
     else:
-        # Two distinct ways this mask can turn out to have no usable
+        # Three distinct ways this mask can turn out to have no usable
         # confluent-tissue topology: no cell-cell junctions anywhere (raised
-        # by Segmenter.find_vertices), or some junctions exist but no cell is
+        # by Segmenter.find_vertices); some junctions exist but no cell is
         # deep enough into a touching group to count as genuinely interior
-        # (raised by VMSI.classify_cells - e.g. scattered isolated cells with
-        # a few small touching clusters, none large enough to have a "bulk"
-        # cell). Both mean there's no vertex-network topology worth jointly
-        # optimising over, so both fall back to the standalone per-cell
+        # (raised by VMSI.classify_cells); or classify_cells found candidate
+        # bulk cells but build_diff_operators' further filtering (edges must
+        # border exactly 2 real cells, minimum incidence counts) whittled
+        # them down to nothing anyway (raised by VMSI.build_diff_operators) -
+        # e.g. scattered isolated cells with a few small touching clusters,
+        # none large enough to have a well-constrained local network. All
+        # three mean there's no vertex-network topology worth jointly
+        # optimising over, so all fall back to the standalone per-cell
         # Laplace-pressure method instead of propagating the error.
-        no_topology_messages = ("No triple-junction vertices found", "No bulk (fully interior) cells found")
+        no_topology_messages = (
+            "No triple-junction vertices found",
+            "No bulk (fully interior) cells found",
+            "No usable edges or vertices remain after filtering",
+        )
         try:
             # process segmented image for input into VMSI
             seg = Segmenter(masks=img, labelled=is_labelled)
