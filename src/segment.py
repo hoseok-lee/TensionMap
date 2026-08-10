@@ -112,7 +112,12 @@ class Segmenter:
                 "skimage.segmentation.expand_labels."
             )
         v = np.array([np.flip(np.round(regionprops.centroid).astype(int)) for regionprops in measure.regionprops(cc)])
-        a = np.array([regionprops.coords for regionprops in measure.regionprops(cc)])
+        # Each region's coords array can have a different number of pixels
+        # (branch points aren't all the same size/shape), so this is
+        # genuinely ragged - a is only ever indexed per-region (a[i]) below,
+        # never used as a single rectangular array, so dtype=object is
+        # correct here rather than trying to stack them.
+        a = np.array([regionprops.coords for regionprops in measure.regionprops(cc)], dtype=object)
         # regionprops returns the coordinates in numpy indexing rather than cartesian indexing - e.g.
         # (rows, cols) rather than (x, y) so flip and re-sort coordinates
         a = a[v[:,0].argsort()]
