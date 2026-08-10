@@ -6,6 +6,7 @@ from scipy.optimize import minimize, least_squares, LinearConstraint
 from sklearn.cluster import KMeans
 import pandas as pd
 from skimage import measure, color
+from skimage.segmentation import expand_labels, find_boundaries
 from matplotlib import cm, patches, colors
 import matplotlib
 from src.segment import Segmenter, set_array_at
@@ -541,6 +542,17 @@ class VMSI():
             if np.sum(np.isin(self.cells.at[cell, 'ncells'], self.bulk_cells)) == 0:
                 bad_cells = np.append(bad_cells, cell)
         self.bulk_cells = self.bulk_cells[np.isin(self.bulk_cells, bad_cells, invert=True)]
+
+        if len(self.bulk_cells) == 0:
+            raise ValueError(
+                "No bulk (fully interior) cells found - every cell in this mask either touches the "
+                "background directly, or only touches other cells that themselves touch the background. "
+                "VMSI's vertex-network inference needs some genuinely interior, confluent tissue to solve "
+                "tensions/pressures against; a mask made up of isolated cells and/or small touching "
+                "clusters with no deep interior can't provide that. Use run_isolated_cells (or run_VMSI, "
+                "which falls back to it automatically) to infer each cell's pressure directly from its own "
+                "boundary curvature instead."
+            )
 
         # This excludes vertices surrounded by boundary cells; edges at these vertices are not constrained enough for accurate inference
         self.bulk_vertices = np.unique(np.concatenate([self.cells.at[cell, 'nverts'] for cell in self.bulk_cells]))
@@ -1811,7 +1823,7 @@ class VMSI():
             return False
 
 def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
-             optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0):
+             optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0, expand_distance=0):
     """
     Main function to run stress inference in a single step.
 
@@ -1838,6 +1850,18 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
                              isolated cells (arbitrary units unless independently measured). Default: 1.0.
     :param isolated_background_pressure: (float) reference pressure assigned to the background for isolated
                                           cells' Young-Laplace inference. Default: 0.0.
+    :param expand_distance: (int) if > 0, close thin background gaps between cells that should actually be
+                             touching (e.g. a resolution-limited segmentation artifact) before running
+                             inference, via skimage.segmentation.expand_labels(distance=expand_distance)
+                             followed by re-carving an explicit boundary with
+                             find_boundaries(mode='subpixel') - the same two-step approach documented in
+                             the README for delineating touching cell labels, just applied automatically.
+                             Keep this small (just above your actual gap width) - too large a distance will
+                             merge cells that are genuinely meant to stay separate. Note find_boundaries in
+                             'subpixel' mode doubles the image's resolution as a side effect, so this can't
+                             currently be combined with holes_mask (pre-process both yourself at matching
+                             resolution instead, then call with expand_distance=0, if you need both).
+                             Default: 0 (disabled).
 
     :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology
              metrics - UNLESS the image is fully non-confluent (no cell has any real neighbour), in which case
@@ -1850,6 +1874,23 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
     # If cells are not labelled, label them
     if not is_labelled:
         img = measure.label(img)
+        is_labelled = True
+
+    if expand_distance > 0:
+        if holes_mask is not None:
+            raise ValueError(
+                "expand_distance can't currently be combined with holes_mask: closing gaps via "
+                "find_boundaries(mode='subpixel') doubles the image's resolution internally, which "
+                "holes_mask wouldn't match. Either pre-process the mask yourself (expand_labels + "
+                "find_boundaries) and resize holes_mask to match before calling run_VMSI, or drop holes_mask."
+            )
+        if verbose:
+            print(f"Closing background gaps up to {expand_distance}px between touching cells...")
+        img = expand_labels(img, distance=expand_distance)
+        boundaries = find_boundaries(img, mode='subpixel')
+        img = measure.label(1 - boundaries)
+        is_labelled = True
+
     # Test whether there are enough cells to tile image
     if not len(np.unique(img))-1 > 2*cells_per_tile and tile:
         print('Not enough cells for tiling; proceeding with a single tile.')
@@ -1922,31 +1963,37 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
 
         model = merge_models(models, p_scale, t_scale, offset, img, verbose=verbose, holes_mask=holes_mask)
     else:
+        # Two distinct ways this mask can turn out to have no usable
+        # confluent-tissue topology: no cell-cell junctions anywhere (raised
+        # by Segmenter.find_vertices), or some junctions exist but no cell is
+        # deep enough into a touching group to count as genuinely interior
+        # (raised by VMSI.classify_cells - e.g. scattered isolated cells with
+        # a few small touching clusters, none large enough to have a "bulk"
+        # cell). Both mean there's no vertex-network topology worth jointly
+        # optimising over, so both fall back to the standalone per-cell
+        # Laplace-pressure method instead of propagating the error.
+        no_topology_messages = ("No triple-junction vertices found", "No bulk (fully interior) cells found")
         try:
             # process segmented image for input into VMSI
             seg = Segmenter(masks=img, labelled=is_labelled)
             VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=holes_mask)
+            # create the model
+            model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=img.shape[0], width=img.shape[1],
+                          verbose=verbose, optimiser=optimiser, mask=labelled_mask,
+                          isolated_tension=isolated_tension, isolated_background_pressure=isolated_background_pressure)
+            # fit the model parameters
+            model.fit()
+            # compute stress tensor
+            model.compute_stresstensor()
         except ValueError as err:
-            # Raised by Segmenter.find_vertices when the mask has no
-            # triple-junction vertices anywhere - i.e. no cell touches any
-            # other cell. There's no vertex-network topology to build at
-            # all, so fall back to the standalone per-cell Laplace-pressure
-            # method entirely instead of propagating the error.
-            if "No triple-junction vertices found" not in str(err):
+            if not any(msg in str(err) for msg in no_topology_messages):
                 raise
             if verbose:
-                print("No cell-cell junctions found in this mask; falling back to "
-                      "run_isolated_cells (per-cell Young-Laplace pressure inference).")
+                print("No usable confluent-tissue topology found in this mask "
+                      f"({err}); falling back to run_isolated_cells (per-cell "
+                      "Young-Laplace pressure inference).")
             return run_isolated_cells(img, is_labelled=True, background_pressure=isolated_background_pressure,
                                        tension=isolated_tension, verbose=verbose)
-        # create the model
-        model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=img.shape[0], width=img.shape[1],
-                      verbose=verbose, optimiser=optimiser, mask=labelled_mask,
-                      isolated_tension=isolated_tension, isolated_background_pressure=isolated_background_pressure)
-        # fit the model parameters
-        model.fit()
-        # compute stress tensor
-        model.compute_stresstensor()
     return model
 
 def _fit_circle_to_contour(contour_xy):
