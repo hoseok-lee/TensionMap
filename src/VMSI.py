@@ -1974,24 +1974,21 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
 
         model = merge_models(models, p_scale, t_scale, offset, img, verbose=verbose, holes_mask=holes_mask)
     else:
-        # Three distinct ways this mask can turn out to have no usable
-        # confluent-tissue topology: no cell-cell junctions anywhere (raised
-        # by Segmenter.find_vertices); some junctions exist but no cell is
-        # deep enough into a touching group to count as genuinely interior
-        # (raised by VMSI.classify_cells); or classify_cells found candidate
-        # bulk cells but build_diff_operators' further filtering (edges must
-        # border exactly 2 real cells, minimum incidence counts) whittled
-        # them down to nothing anyway (raised by VMSI.build_diff_operators) -
-        # e.g. scattered isolated cells with a few small touching clusters,
-        # none large enough to have a well-constrained local network. All
-        # three mean there's no vertex-network topology worth jointly
-        # optimising over, so all fall back to the standalone per-cell
-        # Laplace-pressure method instead of propagating the error.
-        no_topology_messages = (
-            "No triple-junction vertices found",
-            "No bulk (fully interior) cells found",
-            "No usable edges or vertices remain after filtering",
-        )
+        # There turn out to be several distinct places (Segmenter.find_vertices,
+        # Segmenter.find_edges, VMSI.classify_cells, VMSI.build_diff_operators,
+        # and plausibly others not yet identified) where a mask with too
+        # little confluent interior tissue - scattered isolated cells, small
+        # touching clusters with no genuinely deep interior, etc. - makes some
+        # intermediate array come up empty and raise a ValueError. Rather than
+        # maintaining a growing whitelist of exact error strings from each
+        # site individually (which needed a new entry nearly every time a
+        # differently-shaped sparse mask was tried), treat *any* ValueError
+        # raised while building/fitting the main confluent-tissue model as
+        # evidence this mask doesn't have enough usable topology, and fall
+        # back to the standalone per-cell Laplace-pressure method. The
+        # underlying error is always printed (not just when verbose=True) so
+        # a genuinely unrelated bug in this code path doesn't get silently
+        # misattributed to "not enough topology" without you seeing why.
         try:
             # process segmented image for input into VMSI
             seg = Segmenter(masks=img, labelled=is_labelled)
@@ -2005,12 +2002,11 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
             # compute stress tensor
             model.compute_stresstensor()
         except ValueError as err:
-            if not any(msg in str(err) for msg in no_topology_messages):
-                raise
-            if verbose:
-                print("No usable confluent-tissue topology found in this mask "
-                      f"({err}); falling back to run_isolated_cells (per-cell "
-                      "Young-Laplace pressure inference).")
+            print(f"run_VMSI: the main confluent-tissue pipeline failed ({err}); "
+                  "treating this as insufficient interior topology and falling back to "
+                  "run_isolated_cells (per-cell Young-Laplace pressure inference). If this "
+                  "mask should have had enough confluent tissue to avoid this, the error "
+                  "above is worth a closer look rather than trusting this fallback.")
             return run_isolated_cells(img, is_labelled=True, background_pressure=isolated_background_pressure,
                                        tension=isolated_tension, verbose=verbose)
     return model

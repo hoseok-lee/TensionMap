@@ -291,6 +291,16 @@ class Segmenter:
                 edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
                 E_df = pd.concat([E_df, edge_df], ignore_index=True)
 
+        if len(E_df) == 0:
+            raise ValueError(
+                "No edges could be traced between this mask's vertices - branch-point vertices exist, "
+                "but no background skeleton segment between any pair of them satisfied both the distance "
+                "threshold (Segmenter.very_far) and the already-known-neighbour check. This is the same "
+                "underlying issue as having no confluent interior tissue - VMSI's vertex-network inference "
+                "needs real, traceable edges to work with. Use run_isolated_cells (or run_VMSI, which "
+                "falls back to it automatically) instead."
+            )
+
         # Edit V_df and C_df with edge information
         for v in range(0, len(obj.V_df)):
             for nv in obj.V_df.at[v, 'nverts']:
