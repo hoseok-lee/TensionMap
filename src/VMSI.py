@@ -12,6 +12,7 @@ import matplotlib
 from src.segment import Segmenter, set_array_at
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import warnings
+from concurrent.futures import ProcessPoolExecutor
 
 
 def sx_grad(p1, p2, q1x, q1y, q2x, q2y, rx, ry):
@@ -864,9 +865,17 @@ class VMSI():
             import nlopt
             scale = 0.5 * (np.mean(np.linalg.norm(t1_0, axis=1)) + np.mean(np.linalg.norm(t2_0, axis=1)))
 
+            # nlopt doesn't reliably return its best-found point (see the
+            # try/except around init_opt.optimize below), so the last
+            # evaluated x is captured here instead of round-tripping through
+            # a CSV file on every single evaluation (up to thousands of times
+            # per fit) - same information, no disk I/O, and no precision loss
+            # from np.savetxt's default text formatting.
+            last_x = [None]
+
             # Define energy function for initial minimisation
             def energy(x, grad=np.array([])):
-                np.savetxt('./.init_opt.csv', x, delimiter=',',fmt='%f')
+                last_x[0] = x.copy()
                 x = x.reshape(x0.shape, order='F')
                 q = x[:,0:2]
                 p = x[:,2]
@@ -971,24 +980,23 @@ class VMSI():
             # Nlopt can raise a bare RuntimeError (e.g. roundoff-limited: it
             # can no longer improve given floating-point precision) instead
             # of returning normally once converged. The code already doesn't
-            # trust optimize()'s return value - it re-reads the last
-            # evaluated point from the log file below regardless - so treat
-            # that exception the same way: not a failure, just an early
+            # trust optimize()'s return value - it uses the last evaluated
+            # point captured by energy() above regardless - so treat that
+            # exception the same way: not a failure, just an early
             # (already-converged) exit from this particular call.
             # nlopt's own exception class (its C++ std::runtime_error,
             # exposed as a plain lowercase "runtime_error" type) isn't a
             # subclass of Python's builtin RuntimeError, so catch broadly -
             # any exception here means "stop trying to optimize further",
-            # which is exactly what the CSV re-read below already assumes.
+            # which is exactly what falling back to last_x below already assumes.
             try:
                 init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
             except Exception:
                 pass
 
             # For larger systems, the nlopt optimiser will not converge to the desired tolerance and does not return the results obtained at the final step
-            # To get around this, retrieve results from log file
-            x = np.genfromtxt('.init_opt.csv', delimiter=',')
-            x = x.reshape(x0.shape, order='F')
+            # To get around this, use the last point energy() evaluated
+            x = last_x[0].reshape(x0.shape, order='F')
 
             q = x[:,0:2]
             p = x[:,2]
@@ -1026,9 +1034,13 @@ class VMSI():
             # Once q, p are optimised, perform initial optimisation for theta
             theta0 = self.estimate_theta(x)
 
+            # See last_x above for why this is captured in memory instead of
+            # written to disk on every evaluation.
+            last_theta = [None]
+
             # Define energy function for theta optimisation
             def theta_energy(theta, grad=np.array([])):
-                np.savetxt('./.theta_opt.csv', theta, delimiter=',',fmt='%f')
+                last_theta[0] = theta.copy()
 
                 dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
                 # Clamp away from the dP=0 singularity (see comment above
@@ -1151,8 +1163,7 @@ class VMSI():
             except Exception:
                 pass
 
-            theta = np.genfromtxt('.theta_opt.csv', delimiter=',')
-            theta = np.array(theta)
+            theta = last_theta[0]
 
         elif self.optimiser == 'matlab':
             # Equivalent optimisation steps for matlab optimiser instead
@@ -1214,8 +1225,11 @@ class VMSI():
             # theta_energy - same floor, kept consistent so both stages
             # regularise the dP=0 singularity the same way.
             min_dp = 1e-2
+            # See last_x in initial_minimization for why this is captured in
+            # memory instead of written to disk on every evaluation.
+            last_X = [None]
             def objective(X, grad=np.array([])):
-                np.savetxt('./.main_opt.csv', X, delimiter=',',fmt='%f')
+                last_X[0] = X.copy()
                 X = X.reshape(X0.shape, order='F')
 
                 q = X[:,0:2]
@@ -1339,8 +1353,8 @@ class VMSI():
             main_opt.set_maxeval(2000)
 
             # See the matching try/except around init_opt/theta_opt.optimize
-            # in initial_minimization - same reasoning: X is re-read from the
-            # log file as the source of truth regardless, so an exception
+            # in initial_minimization - same reasoning: X falls back to the
+            # last point objective() evaluated regardless, so an exception
             # from nlopt itself (e.g. roundoff-limited, which is what the
             # value flatlining right before the crash indicates) isn't a
             # failure here. Caught broadly since nlopt's own exception class
@@ -1351,8 +1365,7 @@ class VMSI():
             except Exception:
                 pass
 
-            X = np.genfromtxt('.main_opt.csv', delimiter=',')
-            X = X.reshape(X0.shape, order='F')
+            X = last_X[0].reshape(X0.shape, order='F')
         elif self.optimiser == 'matlab':
             import matlab
 
@@ -1833,8 +1846,31 @@ class VMSI():
         else:
             return False
 
+def _fit_tile(args):
+    """
+
+    Build topology and fit a single VMSI model for one tile. Each tile is
+    completely independent of every other one until run_VMSI's later
+    pairwise-overlap merge step, so this is the unit of work farmed out to
+    worker processes when tile=True - kept as a plain module-level function
+    (rather than a closure inside run_VMSI) since that's what
+    ProcessPoolExecutor needs to be able to pickle and ship to a worker.
+
+    :param args: (tile, tile_holes_mask, is_labelled, verbose, optimiser) tuple.
+    :return: fitted VMSI object for this tile.
+
+    """
+    tile, tile_holes_mask, is_labelled, verbose, optimiser = args
+    seg = Segmenter(masks=tile, labelled=is_labelled)
+    VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=tile_holes_mask)
+    model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df,
+                 height=tile.shape[0], width=tile.shape[1], verbose=verbose, optimiser=optimiser)
+    model.fit()
+    return model
+
 def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
-             optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0, expand_distance=0):
+             optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0, expand_distance=0,
+             n_jobs=None):
     """
     Main function to run stress inference in a single step.
 
@@ -1873,6 +1909,10 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
                              currently be combined with holes_mask (pre-process both yourself at matching
                              resolution instead, then call with expand_distance=0, if you need both).
                              Default: 0 (disabled).
+    :param n_jobs: (int) only used when tile=True. Number of tiles to fit in parallel, each in its own
+                   process (tiles are independent until the pairwise-overlap merge step afterwards, so
+                   this parallelises cleanly). None uses all available CPU cores (os.cpu_count()); 1 fits
+                   tiles sequentially in the current process, same as before this option existed. Default: None.
 
     :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology
              metrics - UNLESS the image is fully non-confluent (no cell has any real neighbour), in which case
@@ -1915,18 +1955,21 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
         pairwise_tensions = []
         pairwise_pressures = []
 
-        # Iterate through each tile and do stress inference
-        for i in range(len(tiles)):
-            tile = tiles[i]
-            tile_holes_mask = holes_masks[i]
-            # process segmented image for input into VMSI
-            seg = Segmenter(masks=tile, labelled=is_labelled)
-            VMSI_obj, labelled_mask = seg.process_segmented_image(holes_mask=tile_holes_mask)
-            # create the model
-            model = VMSI(vertices=VMSI_obj.V_df, cells=VMSI_obj.C_df, edges=VMSI_obj.E_df, height=tile.shape[0], width=tile.shape[1], verbose=verbose, optimiser=optimiser)
-            # fit the model parameters
-            model.fit()
-            models.append(model)
+        # Each tile is independent of every other one until the pairwise-
+        # overlap merge step below, so fit them in parallel worker processes
+        # rather than one after another in this process. n_jobs=1 keeps the
+        # old sequential behaviour (e.g. if a single tile's fit already
+        # saturates a core, or for easier debugging/profiling).
+        tile_args = [(tiles[i], holes_masks[i], is_labelled, verbose, optimiser) for i in range(len(tiles))]
+        if n_jobs == 1:
+            models = [_fit_tile(a) for a in tile_args]
+        else:
+            if verbose:
+                print(f"Fitting {len(tiles)} tiles in parallel (n_jobs={n_jobs or 'all cores'})...")
+            with ProcessPoolExecutor(max_workers=n_jobs) as executor:
+                # map() preserves input order in its output, so models[i]
+                # still lines up with tiles[i]/offset[i] as adj_tiles assumes.
+                models = list(executor.map(_fit_tile, tile_args))
         # For each pair of adjacent tiles, determine cell overlap and record overlapping tensions and pressures
         for i in range(len(adj_tiles)):
             pair = adj_tiles[i]

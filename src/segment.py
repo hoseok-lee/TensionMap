@@ -11,6 +11,7 @@ import skimage.draw as draw
 from src.bwmorph import *
 import pandas as pd
 from scipy.spatial.distance import cdist
+from scipy.sparse import coo_matrix
 
 def set_array_at(df, idx, col, arr):
     """
@@ -123,21 +124,23 @@ class Segmenter:
         a = a[v[:,0].argsort()]
         v = v[v[:,0].argsort()]
 
-        R = np.zeros([2,v.shape[0]])
+        # R[0,:]/R[1,:] are just v's two columns transposed - no need to
+        # build this element-by-element in the loop below.
+        R = v.T.astype(float)
+
+        # Each vertex's local cell-neighbourhood only needs a small slice
+        # around its own branch-point region, so this loop is O(V) with a
+        # small constant per iteration - not the quadratic cost below.
+        rows = []
         for i in range(v.shape[0]):
-
-            vertex = v[i,:]
             # Flip again to convert back to numpy indexing
-            ncells = mask[min(a[i][:,0])-1:max(a[i][:,0])+2, min(a[i][:,1])-1:max(a[i][:,1])+2]
-            ncells = np.unique(ncells[ncells!=0])-1
-
-            vertex_df = pd.DataFrame({'coords':[vertex],'ncells':[ncells],'nverts':[np.array([])],'edges':[np.array([])]})
-            V_df = pd.concat([V_df, vertex_df], ignore_index=True)
-
-            R[0, i] = vertex[0]
-            R[1, i] = vertex[1]
-        # Identify neighbour vertices
-        adj = np.zeros([v.shape[0],v.shape[0]])
+            local = mask[min(a[i][:,0])-1:max(a[i][:,0])+2, min(a[i][:,1])-1:max(a[i][:,1])+2]
+            ncells = np.unique(local[local!=0])-1
+            rows.append({'coords': v[i,:], 'ncells': ncells, 'nverts': np.array([]), 'edges': np.array([])})
+        # Build the DataFrame once instead of growing it one row at a time
+        # via pd.concat, which copies the whole DataFrame on every
+        # iteration (O(V^2) for V vertices instead of O(V)).
+        V_df = pd.DataFrame(rows, columns=['coords','ncells','nverts','edges'])
 
         D = np.add(np.tile(np.sum(np.multiply(R, R), axis=0), (v.shape[0],1)),
                    np.tile(np.sum(np.multiply(R, R), axis=0), (v.shape[0],1)).T) - 2*np.matmul(R.T, R)
@@ -155,17 +158,26 @@ class Segmenter:
                 ncells = np.array([0])
             C_df.at[C, 'ncells'] = ncells
 
-        for i in range(v.shape[0]):
-            for j in range(i+1,v.shape[0]):
-                if D[i,j] <= np.power(self.very_far, 2):
-                    v1_ncells = V_df['ncells'].iloc[i]
-                    v1_ncells = v1_ncells[v1_ncells != 0]
-                    v2_ncells = V_df['ncells'].iloc[j]
-                    v2_ncells = v2_ncells[v2_ncells != 0]
+        # Identify neighbour vertices. The original approach checked, for
+        # every pair of vertices, whether they share >=2 neighbouring cells
+        # via np.intersect1d - an O(V^2) Python double loop. That "shared
+        # cell count between every pair" is exactly what a vertex-by-cell
+        # incidence matrix M gives via M @ M.T: entry (i,j) of that product
+        # is sum_c M[i,c]*M[j,c], i.e. the number of cells common to vertices
+        # i and j. Each vertex only touches a handful of cells, so M is very
+        # sparse and this multiplication is cheap regardless of V, unlike
+        # the O(V^2) loop it replaces.
+        filtered_ncells = [np.unique(nc[nc != 0]).astype(int) for nc in V_df['ncells']]
+        row_idx = np.repeat(np.arange(len(filtered_ncells)), [len(fc) for fc in filtered_ncells])
+        col_idx = np.concatenate(filtered_ncells)
+        M = coo_matrix((np.ones(len(row_idx)), (row_idx, col_idx)), shape=(v.shape[0], len(C_df))).tocsr()
+        shared_counts = (M @ M.T).toarray()
 
-                    if np.intersect1d(v1_ncells, v2_ncells).size >=2:
-                        adj[i,j] = 1
-                        adj[j,i] = 1
+        dist_mask = D <= np.power(self.very_far, 2)
+        adj = ((shared_counts >= 2) & dist_mask).astype(float)
+        np.fill_diagonal(adj, 0)  # a vertex is never its own neighbour (the original loop only ever compared i against j>i)
+
+        for i in range(v.shape[0]):
             # Ensure that the list format remains
             # Pandas will force single-element np.ndarrays to be an integer (not iterable)
             V_df['nverts'].iloc[i] = np.where(adj[i,:]==1)[0].tolist()
@@ -185,30 +197,39 @@ class Segmenter:
 
     def find_cells(self, mask):
         # Identify cells, record region information
-        C_df = pd.DataFrame(columns = ['centroids','nverts','numv','ncells','edges', 'area', 'holes',\
-                                       'inertia', 'perimeter','polygon_perimeter','feret_d', \
-                                       'moments_hu','bbox','label'])
+        # regionprops(mask) is a real cost (an internal full scan of the
+        # labelled image, computing many per-region properties) - cache it
+        # once and read every property from the same list instead of calling
+        # it 5 separate times for centroid/perimeter/inertia/bbox/moments_hu.
+        regions = measure.regionprops(mask)
 
         # regionprops returns the co-ordinates in numpy indexing rather than cartesian indexing - e.g.
         # (rows, cols) rather than (x, y) so flip
-        c = np.array([np.flip(regionprops.centroid) for regionprops in measure.regionprops(mask)])
-        p = np.array([regionprops.perimeter for regionprops in measure.regionprops(mask)])
-        ine = np.array([regionprops.inertia_tensor[np.triu_indices(2)] for regionprops in measure.regionprops(mask)])
-        bbox = np.array([[regionprops.bbox[3]-regionprops.bbox[1],regionprops.bbox[2]-regionprops.bbox[0]] for regionprops in measure.regionprops(mask)])
-        moments_hu = np.array([regionprops.moments_hu for regionprops in measure.regionprops(mask)])
+        c = np.array([np.flip(r.centroid) for r in regions])
+        p = np.array([r.perimeter for r in regions])
+        ine = np.array([r.inertia_tensor[np.triu_indices(2)] for r in regions])
+        bbox = np.array([[r.bbox[3]-r.bbox[1], r.bbox[2]-r.bbox[0]] for r in regions])
+        moments_hu = np.array([r.moments_hu for r in regions])
         cell_props = pd.DataFrame(measure.regionprops_table(mask, properties=('label', 'feret_diameter_max','area')))
 
 
         # estimate very_far to be the half the maximum cell perimeter
         self.very_far = np.max(p[1:])/2
 
+        # Build every row as a plain dict first, then construct the DataFrame
+        # once at the end. pd.concat in a loop copies the entire
+        # already-built DataFrame on every iteration, making this O(N^2) in
+        # the number of cells for what should be an O(N) operation.
+        rows = []
         for i in range(c.shape[0]):
-            cell_df = pd.DataFrame({'centroids':[c[i,:]],'nverts':[np.array([])],'numv':0,'ncells':[np.array([])], 'edges':[np.array([])], \
-                                    'area':cell_props.at[i,'area'], 'holes':False, 'inertia':[ine[i]], \
-                                    'perimeter':p[i], 'polygon_perimeter':0, \
-                                    'feret_d':cell_props.at[i,'feret_diameter_max'], \
-                                    'moments_hu':[moments_hu[i,:]],'bbox':[bbox[i,:]],'label':0})
-            C_df = pd.concat([C_df, cell_df], ignore_index=True)
+            rows.append({'centroids': c[i,:], 'nverts': np.array([]), 'numv': 0, 'ncells': np.array([]), 'edges': np.array([]),
+                        'area': cell_props.at[i,'area'], 'holes': False, 'inertia': ine[i],
+                        'perimeter': p[i], 'polygon_perimeter': 0,
+                        'feret_d': cell_props.at[i,'feret_diameter_max'],
+                        'moments_hu': moments_hu[i,:], 'bbox': bbox[i,:], 'label': 0})
+        C_df = pd.DataFrame(rows, columns=['centroids','nverts','numv','ncells','edges', 'area', 'holes',
+                                            'inertia', 'perimeter','polygon_perimeter','feret_d',
+                                            'moments_hu','bbox','label'])
         return C_df
 
     def identify_holes(self, obj):
@@ -266,6 +287,17 @@ class Segmenter:
         end_labels = b_l[re[:,1],re[:,0]]
         b_props = measure.regionprops(b_l)
 
+        # Build every row as a plain dict first, then construct the
+        # DataFrame once - see the same fix in find_cells/find_vertices for
+        # why pd.concat in a loop is an O(N^2) way to do this.
+        edge_rows = []
+        # Diagnostics only used if this ends up finding zero edges, to
+        # pinpoint which of the three acceptance conditions is failing
+        # universally instead of guessing.
+        rejected_no_endpoint = 0
+        rejected_not_neighbours = 0
+        rejected_both_exterior = 0
+        rejected_neighbour_dists = []
         for i in range(1, len(np.unique(b_l))):
             end_points = np.argwhere(end_labels==i)
 
@@ -288,10 +320,30 @@ class Segmenter:
                 pix = np.ravel_multi_index(np.flip(b_props[i-1].coords.T), mask.shape[::-1])
                 verts = np.array([v1, v2])
                 cells = np.intersect1d(obj.V_df.at[v1, 'ncells'], obj.V_df.at[v2, 'ncells'])
-                edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
-                E_df = pd.concat([E_df, edge_df], ignore_index=True)
+                edge_rows.append({'pixels': pix, 'verts': verts, 'cells': cells})
+            elif v1 == -1 or v2 == -1:
+                rejected_no_endpoint += 1
+            elif v2 not in obj.V_df.at[v1, 'nverts']:
+                rejected_not_neighbours += 1
+                rejected_neighbour_dists.append(np.linalg.norm(obj.V_df.at[v1,'coords'] - obj.V_df.at[v2,'coords']))
+            else:
+                rejected_both_exterior += 1
+        E_df = pd.DataFrame(edge_rows, columns=['pixels','verts','cells'])
 
         if len(E_df) == 0:
+            n_verts = len(obj.V_df)
+            n_touch_exterior = sum(1 for k in range(n_verts) if k in obj.C_df.at[0, 'nverts'])
+            dist_info = ""
+            if rejected_neighbour_dists:
+                dist_info = (f" Of those, pixel distances ranged "
+                             f"[{min(rejected_neighbour_dists):.1f}, {max(rejected_neighbour_dists):.1f}] "
+                             f"against self.very_far={self.very_far:.1f} (i.e. a pair needs distance <= "
+                             f"{self.very_far:.1f} AND >=2 shared cells to already count as neighbours).")
+            print(f"[diag] candidate segments: {rejected_no_endpoint} had no valid 2-endpoint match, "
+                  f"{rejected_not_neighbours} matched 2 real vertices that find_vertices didn't already "
+                  f"consider neighbours,{dist_info} {rejected_both_exterior} matched neighbouring vertices "
+                  f"that both touch the exterior cell. very_far={self.very_far:.1f}, "
+                  f"{n_touch_exterior}/{n_verts} vertices touch the exterior cell.")
             raise ValueError(
                 "No edges could be traced between this mask's vertices - branch-point vertices exist, "
                 "but no background skeleton segment between any pair of them satisfied both the distance "
@@ -302,15 +354,28 @@ class Segmenter:
             )
 
         # Edit V_df and C_df with edge information
+        # The original approach re-stacked ALL of E_df's verts into one
+        # array (np.vstack(E_df['verts'])) and re-scanned it from scratch on
+        # every single (v, nv) pair checked below - O(E) work repeated for
+        # every one of the ~3V vertex-neighbour pairs, i.e. O(V*E) overall,
+        # which is just as costly as the O(V^2) adjacency loop fixed above
+        # for a tissue where both V and E scale with cell count. Since new
+        # edges can be created mid-loop (the "Create new edge" branch) and
+        # later iterations need to see them, a one-off precomputed lookup
+        # isn't enough - use a dict kept up to date as edges are added, so
+        # every lookup is O(1) instead of O(E).
+        edge_lookup = {}
+        for idx, vp in enumerate(E_df['verts']):
+            edge_lookup.setdefault((vp[0], vp[1]), idx)
+
         for v in range(0, len(obj.V_df)):
             for nv in obj.V_df.at[v, 'nverts']:
-                edge_1 = np.argwhere((np.vstack(E_df['verts'])[:,0] == v)*(np.vstack(E_df['verts'])[:,1] == nv))
-                edge_2 = np.argwhere((np.vstack(E_df['verts'])[:,1] == v)*(np.vstack(E_df['verts'])[:,0] == nv))
+                idx = edge_lookup.get((v, nv))
+                if idx is None:
+                    idx = edge_lookup.get((nv, v))
 
-                if edge_1.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_1[0])
-                elif edge_2.size > 0:
-                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], edge_2[0])
+                if idx is not None:
+                    obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], idx)
                 elif (v not in obj.C_df.at[0, 'nverts']) and (nv not in obj.C_df.at[0, 'nverts']):
                     # Create new edge
                     line = draw.line(obj.V_df.at[v, 'coords'][1], obj.V_df.at[v, 'coords'][0], obj.V_df.at[nv, 'coords'][1], obj.V_df.at[nv, 'coords'][0])
@@ -319,7 +384,21 @@ class Segmenter:
                     cells = np.intersect1d(obj.V_df.at[v, 'ncells'], obj.V_df.at[nv, 'ncells'])
                     edge_df = pd.DataFrame({'pixels':[pix],'verts':[verts],'cells':[cells]})
                     E_df = pd.concat([E_df, edge_df], ignore_index=True)
+                    # len(E_df) here is actually one past this new row's true
+                    # 0-indexed position (len(E_df)-1) - a pre-existing
+                    # off-by-one in this specific line, kept exactly as-is
+                    # (not something this speed-up is meant to change).
                     obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], len(E_df))
+                    # The lookup dict, however, must hold the *true* index -
+                    # it's what later re-scans of E_df via argwhere would
+                    # have found for any other vertex searching for this
+                    # same edge (argwhere always finds the real position;
+                    # the off-by-one above only ever affected this creating
+                    # vertex's own stored value, not the array itself).
+                    # Using the off-by-one value here instead would silently
+                    # propagate v's bug into every other vertex that later
+                    # looks up this edge, which the original code never did.
+                    edge_lookup[(v, nv)] = len(E_df) - 1
                 else:
                     obj.V_df.at[v, 'edges'] = np.append(obj.V_df.at[v, 'edges'], np.array([-1]))
 
@@ -497,9 +576,27 @@ class Segmenter:
         labels = labels[labels!=0]
         res = pd.DataFrame(np.zeros([len(labels),1]), index=labels, columns=['polygon_perimeter'])
 
+        # A 3x3 dilation can only ever turn a pixel True if it's within 1px
+        # of an already-True pixel, so its effect on a single cell's mask is
+        # entirely contained within that cell's bounding box expanded by 1px
+        # on each side - dilating (and multiplying by branchpoints) on the
+        # full image every time is exact but wasteful, since almost every
+        # pixel touched is nowhere near the cell in question. Crop to that
+        # bbox instead (same result, verified directly against the
+        # full-image version), so each of the N cells does work proportional
+        # to its own size instead of the whole image's.
+        bboxes = {r.label: r.bbox for r in skimage.measure.regionprops(self.masks)}
+        height, width = self.masks.shape
+
         for label in res.index.values:
-            labelled_cell = self.masks==label
-            vertices = np.array(np.where((skimage.morphology.binary_dilation(labelled_cell, footprint=np.ones([3,3])) * branchpoints) > 0)).T
+            min_row, min_col, max_row, max_col = bboxes[label]
+            r0, r1 = max(min_row-1, 0), min(max_row+1, height)
+            c0, c1 = max(min_col-1, 0), min(max_col+1, width)
+
+            local_cell = self.masks[r0:r1, c0:c1] == label
+            local_branch = branchpoints[r0:r1, c0:c1]
+            local_dilated = skimage.morphology.binary_dilation(local_cell, footprint=np.ones([3,3]))
+            vertices = np.array(np.where((local_dilated * local_branch) > 0)).T + np.array([r0, c0])
 
             # calculate polygon perimeter
             v_norm = vertices - np.mean(vertices, axis=0)
