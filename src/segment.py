@@ -312,9 +312,15 @@ class Segmenter:
                     sort1 = np.sort(D[end_points[0],:]).squeeze()
                     sort2 = np.sort(D[end_points[1],:]).squeeze()
                     if abs(sort1[0] - sort1[1]) <= np.sqrt(3):
-                        v1 = np.argsort(D[end_points[0],:]).squeeze()[0]
+                        # Break the v1==v2 tie by falling back to the
+                        # second-closest vertex to end_points[0] - [0] here
+                        # was a pre-existing bug that just recomputed the
+                        # same (closest) vertex np.argmin already found two
+                        # lines above, making this whole disambiguation a
+                        # no-op and leaving v1==v2 unresolved.
+                        v1 = np.argsort(D[end_points[0],:]).squeeze()[1]
                     elif abs(sort2[0] - sort2[1]) <= np.sqrt(3):
-                        v2 = np.argsort(D[end_points[1],:]).squeeze()[0]
+                        v2 = np.argsort(D[end_points[1],:]).squeeze()[1]
 
             if (v1 != -1) and (v2 != -1) and (v2 in obj.V_df.at[v1, 'nverts']) and ((v1 not in obj.C_df.at[0, 'nverts']) or (v2 not in obj.C_df.at[0, 'nverts'])):
                 pix = np.ravel_multi_index(np.flip(b_props[i-1].coords.T), mask.shape[::-1])
