@@ -345,11 +345,21 @@ class Segmenter:
                              f"[{min(rejected_neighbour_dists):.1f}, {max(rejected_neighbour_dists):.1f}] "
                              f"against self.very_far={self.very_far:.1f} (i.e. a pair needs distance <= "
                              f"{self.very_far:.1f} AND >=2 shared cells to already count as neighbours).")
+            n_segments = len(np.unique(b_l)) - 1
+            seg_sizes = [len(p.coords) for p in b_props]
             print(f"[diag] candidate segments: {rejected_no_endpoint} had no valid 2-endpoint match, "
                   f"{rejected_not_neighbours} matched 2 real vertices that find_vertices didn't already "
                   f"consider neighbours,{dist_info} {rejected_both_exterior} matched neighbouring vertices "
                   f"that both touch the exterior cell. very_far={self.very_far:.1f}, "
                   f"{n_touch_exterior}/{n_verts} vertices touch the exterior cell.")
+            print(f"[diag] {n_segments} background skeleton segments were traced for only {n_verts} real "
+                  f"vertices ({n_segments/max(n_verts,1):.1f} segments/vertex - a normal 1px-wide, "
+                  f"single-pixel-thick boundary tessellation should give roughly 1.5). Segment pixel-length "
+                  f"range: [{min(seg_sizes) if seg_sizes else 0}, {max(seg_sizes) if seg_sizes else 0}], "
+                  f"median {np.median(seg_sizes) if seg_sizes else 0:.1f}. Many short segments relative to "
+                  f"vertex count usually means the background between cells isn't a clean single-pixel-wide "
+                  f"skeleton (e.g. thicker or jagged boundaries), which fragments into many small spurious "
+                  f"pieces instead of a handful of long ones once branch points are removed.")
             raise ValueError(
                 "No edges could be traced between this mask's vertices - branch-point vertices exist, "
                 "but no background skeleton segment between any pair of them satisfied both the distance "
