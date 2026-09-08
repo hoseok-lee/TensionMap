@@ -243,6 +243,7 @@ class VMSI():
         self.involved_cells = None
         self.involved_vertices = None
         self.involved_edges = None
+        self.isolated_cells = np.array([], dtype=int)
         self.bulk_cells = None
         self.bulk_vertices = None
         self.ext_cells = None
@@ -1404,7 +1405,12 @@ class VMSI():
         T = np.sum(np.power(T, 2), axis=1)
         T = T * np.abs(np.array([p[alpha] * p[beta] for (alpha,beta) in self.cell_pairs]))
         T = T - np.multiply(np.matmul(self.dC, p), np.matmul(self.dC, theta))
-        T = np.sqrt(T)
+        # Residual optimizer imprecision (nlopt's ftol_rel=1e-6 tolerance) can leave this
+        # term slightly negative at convergence even though the nonlinear constraint keeps
+        # it >=0 in theory; sqrt(negative) silently gives NaN, which then poisons the
+        # per-cell stress tensor for every cell sharing that edge. Clamp at the same
+        # tolerance used elsewhere in this solve rather than let it go negative.
+        T = np.sqrt(np.maximum(T, 0))
         return T
 
     def upload_mechanics(self, p, T, q, theta):
@@ -1503,6 +1509,7 @@ class VMSI():
                     r = self.edges.at[e, 'radius'] if not np.isfinite(radius) else radius
                     self.edges.at[e, 'tension'] = tension if np.isfinite(r) else 0.0
 
+        self.isolated_cells = np.array(isolated, dtype=int)
         return isolated
 
     def compute_stresstensor(self):
@@ -1585,15 +1592,18 @@ class VMSI():
             if np.isin('pressure', options):
                 img = np.zeros_like(mask).astype(float)
                 colourmap = cm.get_cmap('plasma')
-                centroids = np.array(self.cells.loc[self.involved_cells, 'centroids'].tolist())
-                pressures = self.cells.pressure.to_numpy()[self.involved_cells]
+                # Include isolated cells (pressure inferred directly via infer_isolated_cells,
+                # not part of the main confluent network) so they aren't whited out below.
+                plot_cells = np.union1d(self.involved_cells, self.isolated_cells)
+                centroids = np.array(self.cells.loc[plot_cells, 'centroids'].tolist())
+                pressures = self.cells.pressure.to_numpy()[plot_cells]
                 props = measure.regionprops(mask)
                 img_centroids = np.array([np.flip(regionprops.centroid) for regionprops in measure.regionprops(mask)])
 
                 maxP = np.percentile(pressures, 90)
                 indices = np.argmin(cdist(centroids, img_centroids), axis=1)
-                involvedcells_labels = np.zeros(len(self.involved_cells))
-                for i in range(len(self.involved_cells)):
+                involvedcells_labels = np.zeros(len(plot_cells))
+                for i in range(len(plot_cells)):
                     img_index = indices[i]
                     img_label = props[img_index].label
                     involvedcells_labels[i] = img_label
@@ -1636,11 +1646,22 @@ class VMSI():
             for option in options:
                 if option == 'stress':
                     stress = np.array([self.cells.at[cell, 'area'] * np.array([[self.cells.at[cell, 'stress'][0], self.cells.at[cell, 'stress'][1]],[self.cells.at[cell, 'stress'][1], self.cells.at[cell, 'stress'][2]]]) for cell in range(len(self.cells))])
-                    eigvals, eigvects = np.linalg.eig(stress)
-                    scalefct = np.sqrt(np.median(np.multiply(eigvals[:,0], eigvals[:,1])))
+
+                    # A single non-finite cell (e.g. a NaN tension from get_tensions
+                    # propagated through compute_stresstensor) would otherwise fail
+                    # np.linalg.eig for the entire batch. Compute eigenvalues only for
+                    # finite rows and leave the rest as NaN so they're skipped below.
+                    finite_rows = np.isfinite(stress).all(axis=(1,2))
+                    eigvals = np.full((stress.shape[0], 2), np.nan)
+                    eigvects = np.full((stress.shape[0], 2, 2), np.nan)
+                    if finite_rows.any():
+                        eigvals[finite_rows], eigvects[finite_rows] = np.linalg.eig(stress[finite_rows])
+                    scalefct = np.sqrt(np.nanmedian(np.multiply(eigvals[:,0], eigvals[:,1])))
 
                     for i in range(len(self.involved_cells)):
                         cell = self.involved_cells[i]
+                        if not finite_rows[i]:
+                            continue
                         if np.max(stress[i] > 0):
                             centroid = self.cells.at[cell, 'centroids']
                             eigval = eigvals[i,:]
