@@ -244,6 +244,7 @@ class VMSI():
         self.involved_vertices = None
         self.involved_edges = None
         self.isolated_cells = np.array([], dtype=int)
+        self.cluster_cells = np.array([], dtype=int)
         self.bulk_cells = None
         self.bulk_vertices = None
         self.ext_cells = None
@@ -1391,6 +1392,7 @@ class VMSI():
         T = self.get_tensions(q, p, theta)
         self.upload_mechanics(p, T, q, theta)
         self.infer_isolated_cells()
+        self.infer_cluster_cells()
         return
 
 
@@ -1512,6 +1514,176 @@ class VMSI():
         self.isolated_cells = np.array(isolated, dtype=int)
         return isolated
 
+    def _edge_curvature_sign(self, rho, cell_a, cell_b):
+        """
+        Determine which side of a fitted arc (centre rho) is the higher-pressure
+        side, following the same soap-film convention as everywhere else in VMSI:
+        for an interface separating regions of pressure p_a > p_b, the arc bulges
+        away from its own centre of curvature into the lower-pressure region, so
+        the centre of curvature always lies on the higher-pressure side.
+
+        :return: +1 if cell_a is the higher-pressure side, -1 if cell_b is,
+                 or +1 by default if this can't be determined (e.g. no mask
+                 available and one side is background) - matching the outward-
+                 bulge assumption already used by infer_isolated_cells.
+        """
+        if not np.all(np.isfinite(rho)):
+            # Flat edge (radius=inf) - sign is irrelevant since curvature is 0
+            return 1
+
+        if self.mask is not None:
+            row, col = int(round(rho[1])), int(round(rho[0]))
+            if 0 <= row < self.mask.shape[0] and 0 <= col < self.mask.shape[1]:
+                label = self.mask[row, col]
+                if label == cell_a:
+                    return 1
+                if label == cell_b:
+                    return -1
+            # rho fell outside the mask or on neither cell (thin/noisy arc) -
+            # fall through to the centroid-distance heuristic below
+
+        if cell_a != 0 and cell_b != 0:
+            dist_a = np.linalg.norm(rho - np.array(self.cells.at[cell_a, 'centroids']))
+            dist_b = np.linalg.norm(rho - np.array(self.cells.at[cell_b, 'centroids']))
+            return 1 if dist_a <= dist_b else -1
+
+        # One side is background with no reliable centroid to compare against -
+        # default to assuming the real cell bulges outward (higher pressure),
+        # the same convention infer_isolated_cells uses for isolated cells.
+        return 1 if cell_b == 0 else -1
+
+    def infer_cluster_cells(self, background_pressure=None, tension=None):
+        """
+        Generalizes infer_isolated_cells() to small clusters of mutually-touching
+        cells that never reach a bulk (fully interior) cell - so they're excluded
+        from self.involved_cells (see classify_cells) - but that also aren't
+        purely background-facing singletons either, so infer_isolated_cells
+        skips them too (they're absent from self.isolated_cells).
+
+        Uses the same fixed, uniform interfacial tension convention as
+        infer_isolated_cells, but generalizes the single-circle-per-cell fit to
+        a per-edge Young-Laplace system solved jointly across each cluster:
+        every edge already has a fitted radius/centre of curvature from
+        fit_circle() (run in prepare_data(), before this is called), giving one
+        linear equation p_a - p_b = tension / radius_edge per edge, with the
+        sign resolved by which side of the arc's centre of curvature falls on
+        (see _edge_curvature_sign). Solving this (typically over-determined,
+        since most cluster cells border several edges) linear system per
+        cluster in a least-squares sense gives every cell in it a pressure
+        relative to background_pressure - this exactly reduces to
+        infer_isolated_cells's own equation for a cluster of size 1 bordering
+        only background, and background_pressure anchors the (rare) cluster
+        that happens not to border background directly via a weak Tikhonov
+        regularization term, so the system is never rank-deficient.
+
+        :param background_pressure: reference pressure assigned to cell 0. Defaults to
+                                    self.isolated_background_pressure (set at construction).
+        :param tension: assumed uniform interfacial tension for every edge in a
+                        cluster (arbitrary units unless independently measured).
+                        Defaults to self.isolated_tension.
+        :return: list of cell indices that were processed.
+        """
+        if background_pressure is None:
+            background_pressure = self.isolated_background_pressure
+        if tension is None:
+            tension = self.isolated_tension
+
+        all_cells = np.arange(1, len(self.cells))
+        gap_cells = np.setdiff1d(np.setdiff1d(all_cells, self.involved_cells), self.isolated_cells)
+        gap_set = set(gap_cells.tolist())
+
+        # Group gap cells into connected clusters via mutual (non-background) adjacency
+        visited = set()
+        clusters = []
+        for c in gap_cells:
+            if c in visited:
+                continue
+            visited.add(c)
+            stack = [c]
+            cluster = []
+            while stack:
+                cur = stack.pop()
+                cluster.append(cur)
+                for n in np.array(self.cells.at[cur, 'ncells'], dtype=int):
+                    if n in gap_set and n not in visited:
+                        visited.add(n)
+                        stack.append(n)
+            clusters.append(np.array(cluster, dtype=int))
+
+        processed = []
+        anchor_weight = 1e-3
+
+        for cluster in clusters:
+            cluster_index = {int(cell): i for i, cell in enumerate(cluster)}
+            k = len(cluster)
+
+            # Gather every edge touching any cell in this cluster exactly once
+            cluster_edges = set()
+            for cell in cluster:
+                cell_edges = self.cells.at[cell, 'edges']
+                if hasattr(cell_edges, '__len__'):
+                    for e in np.array(cell_edges, dtype=int):
+                        if e >= 0:
+                            cluster_edges.add(int(e))
+
+            rows = []
+            rhs = []
+            used_edges = []
+            for e in cluster_edges:
+                edge_cells = self.edges.at[e, 'cells']
+                if len(edge_cells) != 2:
+                    continue
+                a, b = int(edge_cells[0]), int(edge_cells[1])
+                a_in, b_in = a in cluster_index, b in cluster_index
+                if not (a_in or b_in):
+                    continue
+                if not (a_in and b_in) and a != 0 and b != 0:
+                    # Borders a cell outside this cluster/background - shouldn't
+                    # happen (gap cells only ever touch background or other gap
+                    # cells), but skip defensively rather than assume.
+                    continue
+
+                radius = self.edges.at[e, 'radius']
+                kappa = 1.0/radius if np.isfinite(radius) and radius > 0 else 0.0
+                rho = np.array(self.edges.at[e, 'rho'], dtype=float)
+                sign = self._edge_curvature_sign(rho, a, b)
+
+                row = np.zeros(k)
+                if a_in:
+                    row[cluster_index[a]] += 1
+                if b_in:
+                    row[cluster_index[b]] -= 1
+                value = sign * tension * kappa - (background_pressure if a == 0 else 0.0) + (background_pressure if b == 0 else 0.0)
+
+                rows.append(row)
+                rhs.append(value)
+                used_edges.append((e, radius))
+
+            if k == 0:
+                continue
+
+            # Weak per-cell anchor towards background_pressure - keeps the system
+            # well-posed (non-rank-deficient) for the rare cluster with no direct
+            # background-facing edge, while barely perturbing normal, better-
+            # constrained clusters.
+            rows.extend(anchor_weight * np.eye(k))
+            rhs.extend(anchor_weight * background_pressure * np.ones(k))
+
+            A = np.array(rows)
+            b_vec = np.array(rhs)
+            pressures, *_ = np.linalg.lstsq(A, b_vec, rcond=None)
+
+            for cell, p in zip(cluster, pressures):
+                self.cells.at[cell, 'pressure'] = p
+
+            for e, radius in used_edges:
+                self.edges.at[e, 'tension'] = tension if np.isfinite(radius) else 0.0
+
+            processed.extend(cluster.tolist())
+
+        self.cluster_cells = np.array(processed, dtype=int)
+        return processed
+
     def compute_stresstensor(self):
         """
 
@@ -1592,9 +1764,10 @@ class VMSI():
             if np.isin('pressure', options):
                 img = np.zeros_like(mask).astype(float)
                 colourmap = cm.get_cmap('plasma')
-                # Include isolated cells (pressure inferred directly via infer_isolated_cells,
-                # not part of the main confluent network) so they aren't whited out below.
-                plot_cells = np.union1d(self.involved_cells, self.isolated_cells)
+                # Include isolated cells and small disconnected clusters (pressure inferred
+                # directly via infer_isolated_cells/infer_cluster_cells, not part of the main
+                # confluent network) so they aren't whited/greyed out below.
+                plot_cells = np.union1d(np.union1d(self.involved_cells, self.isolated_cells), self.cluster_cells)
                 centroids = np.array(self.cells.loc[plot_cells, 'centroids'].tolist())
                 pressures = self.cells.pressure.to_numpy()[plot_cells]
                 props = measure.regionprops(mask)
@@ -1612,7 +1785,14 @@ class VMSI():
                         p_norm = 1
                     img[mask==img_label] = p_norm
                 img = colourmap(img)
+                # True background (label 0) stays white. Cells present in the mask but with
+                # no computed pressure (neither in the confluent network nor isolated - e.g.
+                # small disconnected touching-clusters with no bulk interior, see classify_cells)
+                # are shown in neutral grey instead, so they're visibly "not modeled" rather
+                # than indistinguishable from background.
+                uncomputed = ~np.isin(mask, involvedcells_labels) & (mask != 0)
                 img[~np.isin(mask, involvedcells_labels),:] = (1,1,1,1)
+                img[uncomputed,:] = (0.75,0.75,0.75,1)
             else:
                 colourmap = cm.get_cmap('Set3')
                 colours = np.array([colourmap(np.mod(i,12)) for i in range(len(np.unique(mask)))])
@@ -1681,7 +1861,7 @@ class VMSI():
                             if theta < 0:
                                 theta = theta + 2*np.pi
                             theta = np.degrees(theta)
-                            stress_ellipse = patches.Ellipse(centroid, eigval[0], eigval[1], theta, fill=False, color='red', lw=3)
+                            stress_ellipse = patches.Ellipse(centroid, eigval[0], eigval[1], angle=theta, fill=False, color='red', lw=3)
                             ax.add_patch(stress_ellipse)
                 elif option == 'tension':
                     maxT = np.percentile(self.return_tensions(), 95)
