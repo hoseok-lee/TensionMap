@@ -1759,6 +1759,16 @@ class VMSI():
         """
         options = [option.lower() for option in options]
 
+        if mask.size > 0 and self.mask is not None and mask.shape != self.mask.shape:
+            raise ValueError(
+                f"mask passed to plot() has shape {mask.shape}, but this model was fit "
+                f"against a mask of shape {self.mask.shape} (self.mask) - cell centroids "
+                f"and coordinates are only meaningful in that coordinate space. This "
+                f"mismatch commonly happens after run_VMSI(..., expand_distance>0), which "
+                f"internally relabels/resizes the mask before fitting. Pass mask=model.mask "
+                f"(this model's own stored mask) instead of your original input array."
+            )
+
         # Pressure first as requires remapping cell area colours
         if mask.size > 0:
             if np.isin('pressure', options):
