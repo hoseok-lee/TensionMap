@@ -2,7 +2,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.ndimage import generic_filter
 from scipy.spatial.distance import cdist
-from scipy.optimize import minimize, least_squares, LinearConstraint
+from scipy.optimize import minimize, least_squares, LinearConstraint, lsq_linear
 from sklearn.cluster import KMeans
 import pandas as pd
 from skimage import measure, color
@@ -1671,7 +1671,12 @@ class VMSI():
 
             A = np.array(rows)
             b_vec = np.array(rhs)
-            pressures, *_ = np.linalg.lstsq(A, b_vec, rcond=None)
+            # Pressure is a power/weight in VMSI's underlying power-diagram geometry
+            # (see get_tensions's |p_a*p_b| term, and the p>=0.001 box constraint the
+            # main solver imposes) - it isn't physically meaningful below background,
+            # so bound the solve rather than let curvature disagreement between edges
+            # push an individual cell negative.
+            pressures = lsq_linear(A, b_vec, bounds=(background_pressure, np.inf)).x
 
             for cell, p in zip(cluster, pressures):
                 self.cells.at[cell, 'pressure'] = p
