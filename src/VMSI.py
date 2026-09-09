@@ -2084,9 +2084,57 @@ def _fit_tile(args):
     model.fit()
     return model
 
+def _remove_small_regions(img, min_size, fill_distance):
+    """
+    Remove connected components smaller than min_size px from a labelled image (the same
+    connectivity=1 relabel + drop-small-regions + expand_labels cleanup the README documents
+    for manual use), letting a real neighbour grow back over the gap where one is within
+    fill_distance.
+
+    A region relabelled with connectivity=1 catches a disconnected noise speck even if it
+    happens to share its raw label ID with an unrelated real cell elsewhere in the image -
+    naively checking areas on the input image directly would miss that.
+
+    A region too far from any real neighbour for expand_labels to reach keeps whatever value
+    it gets filled with but stays physically disconnected from that neighbour's component, so
+    it re-splits into its own (still-too-small) component under the final relabel rather than
+    truly merging. Rather than leave that behind under a new label, verify afterwards and
+    delete any leftover fragment directly instead of retrying the fill.
+    """
+    labels = measure.label(img, connectivity=1)
+    areas = pd.DataFrame(measure.regionprops_table(label_image=labels, properties=('label', 'area')))
+    small = areas.loc[areas['area'] < min_size, 'label'].to_numpy()
+    if small.size == 0:
+        return img, 0
+
+    to_remove = np.isin(labels, small)
+    original = img
+    img = img.copy()
+    img[to_remove] = 0
+    img = expand_labels(img, distance=fill_distance)
+    # Only keep the fill at the positions we actually removed - everything else (including
+    # any real cell pixels expand_labels might have grown across) reverts to its exact
+    # original value.
+    img = np.where(to_remove, img, original)
+    img = measure.label(img)
+
+    # Verify the fill actually merged each removed region into a real neighbour's component -
+    # img is already correctly labelled at this point (by the call directly above), so just
+    # measure areas on it directly rather than relabelling with connectivity=1 again: that
+    # stricter connectivity would flag (and then wrongly delete) a fragment that only merged
+    # diagonally, even though it's now legitimately part of a real cell under the same default
+    # connectivity used for every other measure.label(img) call in this pipeline.
+    areas2 = pd.DataFrame(measure.regionprops_table(label_image=img, properties=('label', 'area')))
+    still_small = areas2.loc[areas2['area'] < min_size, 'label'].to_numpy()
+    if still_small.size > 0:
+        img[np.isin(img, still_small)] = 0
+        img = measure.label(img)
+
+    return img, small.size
+
 def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
              optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0, expand_distance=0,
-             n_jobs=None):
+             min_cell_size=0, n_jobs=None):
     """
     Main function to run stress inference in a single step.
 
@@ -2125,6 +2173,16 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
                              currently be combined with holes_mask (pre-process both yourself at matching
                              resolution instead, then call with expand_distance=0, if you need both).
                              Default: 0 (disabled).
+    :param min_cell_size: (int) if > 0, remove segmentation regions smaller than this many pixels
+                           before inference - the same connectivity=1 relabel + drop-small-regions +
+                           expand_labels(distance=5) cleanup documented in the README for manual use,
+                           just applied automatically. Tiny stray regions (a few px, e.g. segmentation
+                           noise or sub-pixel boundary artifacts) otherwise still enter the vertex-network
+                           fit and can get wildly ill-constrained pressures/tensions from their near-
+                           degenerate geometry, skewing results for the whole tissue. There's no
+                           universally correct threshold - it depends on your image's resolution and
+                           actual cell size (a real small cell shouldn't be caught by this), so this is
+                           opt-in rather than defaulting to some fixed size. Default: 0 (disabled).
     :param n_jobs: (int) only used when tile=True. Number of tiles to fit in parallel, each in its own
                    process (tiles are independent until the pairwise-overlap merge step afterwards, so
                    this parallelises cleanly). None uses all available CPU cores (os.cpu_count()); 1 fits
@@ -2143,6 +2201,11 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
         img = measure.label(img)
         is_labelled = True
 
+    if min_cell_size > 0:
+        img, n_removed = _remove_small_regions(img, min_cell_size, fill_distance=5)
+        if verbose and n_removed > 0:
+            print(f"Removed {n_removed} regions under {min_cell_size}px...")
+
     if expand_distance > 0:
         if holes_mask is not None:
             raise ValueError(
@@ -2157,6 +2220,19 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
         boundaries = find_boundaries(img, mode='subpixel')
         img = measure.label(1 - boundaries)
         is_labelled = True
+
+        # find_boundaries(mode='subpixel') doubles the image's resolution by inserting an
+        # interpolated pixel between every pair of neighbours; at diagonal/corner junctions
+        # where several cells meet, this can strand a single interpolated pixel that belongs
+        # to none of them, which measure.label() then turns into its own 1-3px "cell". These
+        # are pure artifacts of this resampling step (not present in the input mask, so the
+        # user's own pre-filtering can't catch them) - clean them up the same way the README
+        # recommends for real segmentation noise: drop tiny regions, then let their neighbours
+        # expand back over the gap.
+        sliver_min_size = 10
+        img, n_slivers = _remove_small_regions(img, sliver_min_size, fill_distance=expand_distance + 1)
+        if verbose and n_slivers > 0:
+            print(f"Removed {n_slivers} sub-pixel boundary artifacts (<{sliver_min_size}px)...")
 
     # Test whether there are enough cells to tile image
     if not len(np.unique(img))-1 > 2*cells_per_tile and tile:
