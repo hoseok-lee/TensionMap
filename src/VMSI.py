@@ -198,6 +198,64 @@ def radius_grad(p1,p2,q1x,q1y,q2x,q2y,t1,t2):
                    t14*(t27-t7*(t1-t2+p1*t12))*(-0.5)]).T
     return dR
 
+def gather_pairs(X, pairs):
+    """
+    Equivalent to np.matmul(dC, X), where dC is the (n_edges, n_cells) difference
+    operator built in build_diff_operators - dC has exactly one +1 (at pairs[e,0])
+    and one -1 (at pairs[e,1]) per row e, so dC @ X == X[pairs[:,0]] - X[pairs[:,1]]
+    exactly, for any X indexed by cell (1-D or 2-D, e.g. per-cell scalars or q's
+    (n_cells, 2) coordinates). This is O(n_edges) instead of O(n_edges * n_cells),
+    since dC's density (2 nonzeros/row against a potentially large cell count) makes
+    the dense matmul do far more arithmetic than the difference it's actually computing.
+    """
+    return X[pairs[:,0]] - X[pairs[:,1]]
+
+def scatter_pairs(w, pairs, n):
+    """
+    Equivalent to np.matmul(dC.T, w) (dC as in gather_pairs above), i.e. the
+    reverse/reduction direction: accumulate each edge's per-edge value(s) w back
+    onto its two cells (+w at pairs[:,0], -w at pairs[:,1]), summing contributions
+    when multiple edges share a cell. w may be 1-D (n_edges,) or 2-D (n_edges, k).
+    Uses np.bincount per column rather than a dense (n_edges, n_cells) matmul, for
+    the same O(n_edges) vs O(n_edges * n_cells) reason as gather_pairs.
+    """
+    if w.ndim == 1:
+        return np.bincount(pairs[:,0], weights=w, minlength=n) - np.bincount(pairs[:,1], weights=w, minlength=n)
+    out = np.zeros((n, w.shape[1]))
+    for k in range(w.shape[1]):
+        out[:,k] = (np.bincount(pairs[:,0], weights=w[:,k], minlength=n)
+                    - np.bincount(pairs[:,1], weights=w[:,k], minlength=n))
+    return out
+
+def symmetric_scatter_pairs(w, pairs, n):
+    """
+    Equivalent to np.matmul(np.abs(dC).T, w) (dC as in gather_pairs above): like
+    scatter_pairs, but adds w to *both* of an edge's cells (abs(dC) has +1, not
+    -1, at pairs[:,1]) rather than subtracting at the second. w may be 1-D or 2-D.
+    """
+    if w.ndim == 1:
+        return np.bincount(pairs[:,0], weights=w, minlength=n) + np.bincount(pairs[:,1], weights=w, minlength=n)
+    out = np.zeros((n, w.shape[1]))
+    for k in range(w.shape[1]):
+        out[:,k] = (np.bincount(pairs[:,0], weights=w[:,k], minlength=n)
+                    + np.bincount(pairs[:,1], weights=w[:,k], minlength=n))
+    return out
+
+def dense_jacobian_pairs(w, pairs, n_cols):
+    """
+    Equivalent to np.multiply(dC.T, w).T (dC as in gather_pairs above): builds the
+    dense (n_edges, n_cols) matrix nlopt's vector-constraint API requires as an
+    actual dense Jacobian block (so, unlike gather_pairs/scatter_pairs, this can't
+    avoid the O(n_edges * n_cols) output allocation) - but constructs it via direct
+    index assignment into a zeros array instead of an elementwise multiply over the
+    already-dense (mostly-zero) dC.T, avoiding that redundant full pass.
+    """
+    out = np.zeros((w.shape[0], n_cols))
+    rows = np.arange(w.shape[0])
+    out[rows, pairs[:,0]] = w
+    out[rows, pairs[:,1]] = -w
+    return out
+
 class VMSI():
 
     def __init__(self, vertices, cells, edges, width, height, verbose, optimiser='nlopt', mask=None,
@@ -808,27 +866,25 @@ class VMSI():
         q = x[:,0:2]
         p = x[:,2]
 
-        r = np.zeros(len(self.involved_edges))
-        r_flat = np.zeros(len(self.involved_edges))
-        q_sq = np.sum(np.power(np.matmul(self.dC, q), 2), axis=1)
+        dQ = gather_pairs(q, self.cell_pairs)
+        q_sq = np.sum(np.power(dQ, 2), axis=1)
 
-        rho = np.divide(np.matmul(self.dC, np.multiply(q.T,p).T).T, np.matmul(self.dC, p)).T
+        dP = gather_pairs(p, self.cell_pairs)
+        rho = gather_pairs(np.multiply(q.T, p).T, self.cell_pairs) / dP[:,None]
 
-        for i in range(len(self.involved_edges)):
-            edge = self.involved_edges[i]
-            v1 = self.edges.at[edge, 'verts'][0]
-            v2 = self.edges.at[edge, 'verts'][1]
+        # Per-edge vertex coordinates for involved_edges, vectorised instead of a
+        # per-edge Python loop with repeated pandas .at[] lookups.
+        verts_arr = np.stack(self.edges.loc[self.involved_edges, 'verts'].to_numpy())
+        coords_arr = np.array(self.vertices['coords'].tolist())
+        r1 = coords_arr[verts_arr[:,0]]
+        r2 = coords_arr[verts_arr[:,1]]
+        # 0.5*(a^2+b^2) is exactly mean(power([a,b],2)) for the two-element case above.
+        r = 0.5 * (np.sum(np.power(r1 - rho, 2), axis=1) + np.sum(np.power(r2 - rho, 2), axis=1))
+        r_flat = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * q_sq
 
-            r1 = self.vertices['coords'][v1]
-            r2 = self.vertices['coords'][v2]
-
-            r[i] = np.mean(np.power(np.array([np.linalg.norm(r1 - rho[i]), np.linalg.norm(r2 - rho[i])]), 2))
-            r_flat[i] = p[np.where(self.dC[i,:] == 1)] * p[np.where(self.dC[i,:] == -1)] * q_sq[i]
-
-        dP = np.matmul(self.dC, p)
         r = np.multiply(r, np.power(dP, 2))
 
-        A = np.multiply(self.dC.T, dP).T
+        A = dense_jacobian_pairs(dP, self.cell_pairs, len(self.involved_cells))
         b = r_flat - r
 
         theta = np.linalg.lstsq(np.vstack((A, np.ones(A.shape[1]))),np.concatenate((b, np.array([0]))))[0]
@@ -856,8 +912,8 @@ class VMSI():
         q0 = x0[:,0:2]
         p0 = x0[:,2]
 
-        b0 = np.matmul(self.dC, np.multiply(q0.T,p0).T)
-        delta_p0 = np.matmul(self.dC, p0)
+        b0 = gather_pairs(np.multiply(q0.T,p0).T, self.cell_pairs)
+        delta_p0 = gather_pairs(p0, self.cell_pairs)
 
         # Get initial values for t_i and t_j
         t1_0 = b0 - (np.multiply(r1.T,delta_p0).T)
@@ -875,15 +931,31 @@ class VMSI():
             # from np.savetxt's default text formatting.
             last_x = [None]
 
+            # energy() and nonlinear_con() below are both evaluated by nlopt at the
+            # same trial point on essentially every iteration (a gradient-based
+            # constrained solver needs the objective and constraint - and often
+            # their gradients - at the same x before it can take a step), and both
+            # independently recomputed the same b/delta_p from scratch. Cache it
+            # keyed on the raw x bytes so whichever of the two runs second reuses
+            # the first's result instead of redoing the same gather.
+            _bp_cache = {'key': None, 'b': None, 'delta_p': None}
+            def _compute_bp(x_flat, q, p):
+                key = x_flat.tobytes()
+                if _bp_cache['key'] != key:
+                    _bp_cache['key'] = key
+                    _bp_cache['b'] = gather_pairs(np.multiply(q.T,p).T, self.cell_pairs)
+                    _bp_cache['delta_p'] = gather_pairs(p, self.cell_pairs)
+                return _bp_cache['b'], _bp_cache['delta_p']
+
             # Define energy function for initial minimisation
             def energy(x, grad=np.array([])):
                 last_x[0] = x.copy()
+                x_flat = x
                 x = x.reshape(x0.shape, order='F')
                 q = x[:,0:2]
                 p = x[:,2]
 
-                b = np.matmul(self.dC, np.multiply(q.T,p).T)
-                delta_p = np.matmul(self.dC, p)
+                b, delta_p = _compute_bp(x_flat, q, p)
 
                 t1 = np.divide((b - (np.multiply(r1.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r1.T,delta_p).T), axis=1)).T
                 t2 = np.divide((b - (np.multiply(r2.T,delta_p).T)).T,np.linalg.norm(b - (np.multiply(r2.T,delta_p).T), axis=1)).T
@@ -916,12 +988,12 @@ class VMSI():
 
             # Define nonlinear constraint for initial optimisation
             def nonlinear_con(x, grad=np.array([])):
+                x_flat = x
                 x = x.reshape(x0.shape, order='F')
                 q = x[:,0:2]
                 p = x[:,2]
 
-                b = np.matmul(self.dC, np.multiply(q.T,p).T)
-                delta_p = np.matmul(self.dC, p)
+                b, delta_p = _compute_bp(x_flat, q, p)
 
                 l1 = np.linalg.norm(b - (np.multiply(r1.T,delta_p).T), axis=1)
                 l2 = np.linalg.norm(b - (np.multiply(r2.T,delta_p).T), axis=1)
@@ -1040,21 +1112,35 @@ class VMSI():
             # written to disk on every evaluation.
             last_theta = [None]
 
+            # p and q are fixed for this whole stage (only theta is being
+            # optimised), so everything below that depends on p/q alone - not
+            # theta - only needs computing once here, rather than on every one
+            # of the (potentially hundreds of) evaluations of theta_energy/
+            # theta_neqlincon below. Note theta_energy clamps dP away from its
+            # zero-singularity but theta_neqlincon never did - that's a
+            # pre-existing inconsistency between the two, kept exactly as-is
+            # (dP_clamped vs dP_raw) rather than unified as a side effect of
+            # this hoisting.
+            dP_raw = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+            dP_clamped = np.where(dP_raw >= 0, np.maximum(dP_raw, min_dp), np.minimum(dP_raw, -min_dp))
+            dQ_fixed = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
+            QL_fixed = np.sum(np.power(dQ_fixed, 2), axis=1)
+            pp_QL_fixed = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL_fixed
+            rho_fixed = gather_pairs(np.multiply(p, q.T).T, self.cell_pairs) / dP_clamped[:,None]
+            # theta_neqlincon's Jacobian doesn't depend on theta either (it's
+            # ±dP_raw at each edge's two cell columns, same every call), so
+            # its dense (n_edges, n_cells) output can be built once too.
+            theta_con_jacobian = dense_jacobian_pairs(dP_raw, self.cell_pairs, len(self.involved_cells))
+
             # Define energy function for theta optimisation
             def theta_energy(theta, grad=np.array([])):
                 last_theta[0] = theta.copy()
 
-                dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
-                # Clamp away from the dP=0 singularity (see comment above
-                # this function's setup) - kept consistent with the same
-                # clamp applied inside radius_grad_theta's gradient below.
-                dP = np.where(dP >= 0, np.maximum(dP, min_dp), np.minimum(dP, -min_dp))
+                dP = dP_clamped
                 dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
-                dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
-                QL = np.sum(np.power(dQ, 2), axis=1)
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
-                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
+                rho = rho_fixed
+                r_sq = np.divide((pp_QL_fixed - (dP * dT)),np.power(dP, 2))
                 # r_sq<0 doesn't catch NaN (any comparison with NaN is False),
                 # so a stray NaN would otherwise pass straight through
                 # unclamped into sqrt() below. ~(r_sq>=0) treats NaN the same
@@ -1106,17 +1192,15 @@ class VMSI():
 
             # Define nonlinear constraint for theta optimisation
             def theta_neqlincon(result, theta, grad=np.array([])):
-                dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
-                dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
-                QL = np.sum(np.power(dQ, 2), axis=1)
-
-                A = np.multiply(dP, self.dC.T).T
-                b = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL
-
-                E = np.dot(A, theta) - b
+                # np.dot(A, theta) where A = dense_jacobian_pairs(dP_raw, ...) is
+                # exactly dP_raw * dT for each edge (A's row e is +dP_raw[e] at
+                # cell_pairs[e,0], -dP_raw[e] at cell_pairs[e,1]), so this never
+                # needs to materialise A itself just to compute the constraint value.
+                dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
+                E = (dP_raw * dT) - pp_QL_fixed
                 result[:] = E
                 if grad.size > 0:
-                    grad[:] = np.multiply(self.dC.T, dP).T
+                    grad[:] = theta_con_jacobian
                 return
 
             if (theta_energy(np.zeros_like(theta0)) < theta_energy(theta0)):
@@ -1230,27 +1314,49 @@ class VMSI():
             # See last_x in initial_minimization for why this is captured in
             # memory instead of written to disk on every evaluation.
             last_X = [None]
+
+            # objective() and nonlinear_con() below are both evaluated by nlopt
+            # at the same trial point on essentially every iteration, and both
+            # independently gather the same dP/dT/dQ/QL/pp from X. Cache them
+            # keyed on the raw X bytes (same pattern as initial_minimization's
+            # _compute_bp) so whichever runs second reuses the first's work.
+            # Note objective() clamps dP away from zero but nonlinear_con()
+            # never did - a pre-existing inconsistency between the two, kept
+            # exactly as-is: this cache holds the shared *raw* dP, and each
+            # function does its own clamping (or not) on top.
+            _shared_cache = {'key': None}
+            def _compute_shared(x_flat, q, p, theta):
+                key = x_flat.tobytes()
+                if _shared_cache['key'] != key:
+                    _shared_cache['key'] = key
+                    _shared_cache['dP_raw'] = gather_pairs(p, self.cell_pairs)
+                    _shared_cache['dT'] = gather_pairs(theta, self.cell_pairs)
+                    dQ = gather_pairs(q, self.cell_pairs)
+                    _shared_cache['dQ'] = dQ
+                    _shared_cache['QL'] = np.sum(np.power(dQ, 2), axis=1)
+                    _shared_cache['pp'] = p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]]
+                return (_shared_cache['dP_raw'], _shared_cache['dT'], _shared_cache['dQ'],
+                        _shared_cache['QL'], _shared_cache['pp'])
+
             def objective(X, grad=np.array([])):
                 last_X[0] = X.copy()
+                X_flat = X
                 X = X.reshape(X0.shape, order='F')
 
                 q = X[:,0:2]
                 p = X[:,3]
                 theta = X[:,2]
 
-                dP = p[self.cell_pairs[:,0]] - p[self.cell_pairs[:,1]]
+                dP_raw, dT, dQ, QL, pp = _compute_shared(X_flat, q, p, theta)
                 # Clamp away from the dP=0 singularity - dP is a live
                 # optimisation variable here (unlike in theta_energy), so
                 # this also protects against the solver transiently passing
                 # through near-equal-pressure configurations mid-search. Kept
                 # consistent with the same clamp in radius_grad's gradient.
-                dP = np.where(dP >= 0, np.maximum(dP, min_dp), np.minimum(dP, -min_dp))
-                dT = theta[self.cell_pairs[:,0]] - theta[self.cell_pairs[:,1]]
-                dQ = q[self.cell_pairs[:,0],:] - q[self.cell_pairs[:,1],:]
-                QL = np.sum(np.power(dQ, 2), axis=1)
+                dP = np.where(dP_raw >= 0, np.maximum(dP_raw, min_dp), np.minimum(dP_raw, -min_dp))
 
-                rho = np.divide(np.matmul(self.dC,np.multiply(p, q.T).T).T, dP).T
-                r_sq = np.divide(((p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * QL) - (dP * dT)),np.power(dP, 2))
+                rho = gather_pairs(np.multiply(p, q.T).T, self.cell_pairs) / dP[:,None]
+                r_sq = np.divide((pp * QL) - (dP * dT), np.power(dP, 2))
                 # r_sq<=0 doesn't catch NaN (any comparison with NaN is
                 # False), so a stray NaN would otherwise pass straight
                 # through unclamped into sqrt() below. ~(r_sq>0) treats NaN
@@ -1299,31 +1405,31 @@ class VMSI():
                 return E
 
             def nonlinear_con(result, X, grad=np.array([])):
+                X_flat = X
                 X = X.reshape(X0.shape, order='F')
 
                 q = X[:,0:2]
                 p = X[:,3]
                 theta = X[:,2]
 
-                result[:] = (np.matmul(self.dC,p) * np.matmul(self.dC, theta)) - (p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]] * np.sum(np.power(np.matmul(self.dC, q), 2), axis=1))
+                dP_raw, dT, dQ, QL, pp = _compute_shared(X_flat, q, p, theta)
+                result[:] = (dP_raw * dT) - (pp * QL)
 
                 if grad.size>0:
-                    X = X.reshape(X0.shape, order='F')
+                    n_cells = len(self.involved_cells)
+                    # Calculate jacobian of nonlinear constraints. gX/gY/gTh use the
+                    # ±w-at-the-edge's-two-cells pattern (dense_jacobian_pairs); gP's
+                    # second term instead needs the *same* +w at both cells (from
+                    # np.abs(dC) rather than dC itself), so it's built directly.
+                    gX = dense_jacobian_pairs(-2*pp*dQ[:,0], self.cell_pairs, n_cells)
+                    gY = dense_jacobian_pairs(-2*pp*dQ[:,1], self.cell_pairs, n_cells)
+                    gTh = dense_jacobian_pairs(dP_raw, self.cell_pairs, n_cells)
 
-                    q = X[:,0:2]
-                    p = X[:,3]
-                    theta = X[:,2]
-
-                    # Calculate jacobian of nonlinear constraints
-                    dP = np.matmul(self.dC,p)
-                    dT = np.matmul(self.dC, theta)
-                    dQ = np.matmul(self.dC, q)
-                    QL = np.sum(np.power(dQ, 2), axis=1)
-
-                    gX = np.multiply(self.dC.T, -2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,0]).T
-                    gY = np.multiply(self.dC.T, -2*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]]*dQ[:,1]).T
-                    gTh = np.multiply(self.dC.T, dP).T
-                    gP = np.multiply(self.dC.T, dT).T - np.divide(np.multiply(QL*p[self.cell_pairs[:,0]]*p[self.cell_pairs[:,1]],np.abs(self.dC).T).T,p)
+                    QLpp = np.zeros((len(dP_raw), n_cells))
+                    edge_idx = np.arange(len(dP_raw))
+                    QLpp[edge_idx, self.cell_pairs[:,0]] = QL * pp
+                    QLpp[edge_idx, self.cell_pairs[:,1]] = QL * pp
+                    gP = dense_jacobian_pairs(dT, self.cell_pairs, n_cells) - np.divide(QLpp, p)
                     grad[:] = np.hstack([gX,gY,gTh,gP])
                 return
 
@@ -1403,10 +1509,10 @@ class VMSI():
         applies the Young-Laplace law to obtain the tensions at every edge
 
         """
-        T = np.matmul(self.dC, q)
+        T = gather_pairs(q, self.cell_pairs)
         T = np.sum(np.power(T, 2), axis=1)
-        T = T * np.abs(np.array([p[alpha] * p[beta] for (alpha,beta) in self.cell_pairs]))
-        T = T - np.multiply(np.matmul(self.dC, p), np.matmul(self.dC, theta))
+        T = T * np.abs(p[self.cell_pairs[:,0]] * p[self.cell_pairs[:,1]])
+        T = T - np.multiply(gather_pairs(p, self.cell_pairs), gather_pairs(theta, self.cell_pairs))
         # Residual optimizer imprecision (nlopt's ftol_rel=1e-6 tolerance) can leave this
         # term slightly negative at convergence even though the nonlinear constraint keeps
         # it >=0 in theory; sqrt(negative) silently gives NaN, which then poisons the
@@ -1730,7 +1836,7 @@ class VMSI():
         rb = np.divide(rb.T, D).T
         Rot = np.array([[0,-1],[1,0]])
         nb = np.matmul(rb, Rot.T)
-        dP = np.matmul(self.dC, p)
+        dP = gather_pairs(p, self.cell_pairs)
 
         sigmaB = np.zeros([rb.shape[0], 3])
         sigmaB[:,0] = rb[:,0] * T * rb[:,0]
@@ -1742,7 +1848,8 @@ class VMSI():
         sigmaP[:,1] = nb[:,0] * dP * D * nb[:,1]
         sigmaP[:,2] = nb[:,1] * dP * D * nb[:,1]
 
-        sigma = np.matmul(np.abs(self.dC.T), sigmaB) + 0.5 * np.matmul(self.dC.T, sigmaP)
+        n_cells = len(self.involved_cells)
+        sigma = symmetric_scatter_pairs(sigmaB, self.cell_pairs, n_cells) + 0.5 * scatter_pairs(sigmaP, self.cell_pairs, n_cells)
 
         A = np.array(self.cells.area.to_list())[self.involved_cells]
         sigma = np.divide(sigma.T, A)
