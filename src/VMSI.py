@@ -2407,13 +2407,17 @@ def run_VMSI(img, is_labelled=False, holes_mask=None, tile=False, cells_per_tile
 
         # find_boundaries(mode='subpixel') doubles the image's resolution by inserting an
         # interpolated pixel between every pair of neighbours; at diagonal/corner junctions
-        # where several cells meet, this can strand a single interpolated pixel that belongs
-        # to none of them, which measure.label() then turns into its own 1-3px "cell". These
+        # where several cells meet, this can strand a small interpolated region that belongs
+        # to none of them, which measure.label() then turns into its own tiny "cell". These
         # are pure artifacts of this resampling step (not present in the input mask, so the
-        # user's own pre-filtering can't catch them) - clean them up the same way the README
-        # recommends for real segmentation noise: drop tiny regions, then let their neighbours
-        # expand back over the gap.
-        sliver_min_size = 10
+        # user's own min_cell_size pre-filtering, which ran at the original resolution, can't
+        # catch them) - clean them up the same way the README recommends for real
+        # segmentation noise. The threshold has to be in this doubled-resolution space:
+        # min_cell_size px in the original mask is ~4x that many px here (area scales with
+        # the squared 2x linear factor), and every genuine cell already cleared
+        # min_cell_size before doubling, so anything below ~4*min_cell_size here is an
+        # artifact. Keep a small floor for when min_cell_size wasn't set.
+        sliver_min_size = max(10, 4 * min_cell_size)
         img, n_slivers = _remove_small_regions(img, sliver_min_size, fill_distance=expand_distance + 1)
         if verbose and n_slivers > 0:
             print(f"Removed {n_slivers} sub-pixel boundary artifacts (<{sliver_min_size}px)...")
