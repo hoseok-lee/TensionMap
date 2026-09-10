@@ -256,6 +256,23 @@ def dense_jacobian_pairs(w, pairs, n_cols):
     out[rows, pairs[:,1]] = -w
     return out
 
+def _make_stage_pbar(desc, total, active):
+    """
+    Progress bar for one nlopt minimisation stage, ticked once per objective
+    evaluation. Returns a tqdm instance, or None if tqdm isn't installed or the
+    stage isn't being tracked (active=False) - callers must handle None. nlopt
+    has no iteration callback, so the objective function itself does the ticking;
+    `total` is the stage's maxeval (evaluations may finish early, or slightly
+    exceed it via AUGLAG subproblems).
+    """
+    if not active:
+        return None
+    try:
+        from tqdm.auto import tqdm
+    except ImportError:
+        return None
+    return tqdm(total=total, desc=desc, leave=True)
+
 class VMSI():
 
     def __init__(self, vertices, cells, edges, width, height, verbose, optimiser='nlopt', mask=None,
@@ -959,6 +976,9 @@ class VMSI():
             # per fit) - same information, no disk I/O, and no precision loss
             # from np.savetxt's default text formatting.
             last_x = [None]
+            # Holds this stage's tqdm bar (or None) so the objective can tick it
+            # once per evaluation; set just before optimize(), cleared after.
+            _pbar = [None]
 
             # energy() and nonlinear_con() below are both evaluated by nlopt at the
             # same trial point on essentially every iteration (a gradient-based
@@ -1011,7 +1031,10 @@ class VMSI():
                     dE = np.bincount(rows, weights=np.ravel(dE,order='F'))
                     grad[:] = dE
 
-                if self.verbose:
+                if _pbar[0] is not None:
+                    _pbar[0].update(1)
+                    _pbar[0].set_postfix_str(f"E={E:.6g}", refresh=False)
+                elif self.verbose:
                     print(E)
                 return E
 
@@ -1076,7 +1099,8 @@ class VMSI():
             init_opt.set_upper_bounds(ub)
             init_opt.add_inequality_constraint(nonlinear_con, 1e-6)
             init_opt.add_equality_constraint(linear_con, 1e-6)
-            init_opt.set_maxeval(2000)
+            init_maxeval = 2000
+            init_opt.set_maxeval(init_maxeval)
 
             # Optimisation
             # Nlopt can't handle initial values outside bounds so clip values before optimisation
@@ -1092,10 +1116,14 @@ class VMSI():
             # subclass of Python's builtin RuntimeError, so catch broadly -
             # any exception here means "stop trying to optimize further",
             # which is exactly what falling back to last_x below already assumes.
+            _pbar[0] = _make_stage_pbar("Initial minimization (q, p)", init_maxeval, self.verbose)
             try:
                 init_opt.optimize(np.clip(x0.ravel(order='F'), lb, ub))
             except Exception:
                 pass
+            if _pbar[0] is not None:
+                _pbar[0].close()
+            _pbar[0] = None
 
             # For larger systems, the nlopt optimiser will not converge to the desired tolerance and does not return the results obtained at the final step
             # To get around this, use the last point energy() evaluated
@@ -1140,6 +1168,8 @@ class VMSI():
             # See last_x above for why this is captured in memory instead of
             # written to disk on every evaluation.
             last_theta = [None]
+            # See _pbar above - same per-stage tqdm holder for the theta stage.
+            _pbar = [None]
 
             # p and q are fixed for this whole stage (only theta is being
             # optimised), so everything below that depends on p/q alone - not
@@ -1207,7 +1237,10 @@ class VMSI():
                     rows = np.concatenate([self.cell_pairs[:,0], self.cell_pairs[:,1]])
 
                     grad[:] = np.bincount(rows, weights=np.ravel(dE,order='F'))
-                if self.verbose:
+                if _pbar[0] is not None:
+                    _pbar[0].update(1)
+                    _pbar[0].set_postfix_str(f"E={E:.6g}", refresh=False)
+                elif self.verbose:
                     print(E)
                 return float(E)
 
@@ -1266,17 +1299,22 @@ class VMSI():
             theta_bound = 1e8
             theta_opt.set_lower_bounds(-theta_bound * np.ones(theta0.size))
             theta_opt.set_upper_bounds(theta_bound * np.ones(theta0.size))
-            theta_opt.set_maxeval(2000)
+            theta_maxeval = 2000
+            theta_opt.set_maxeval(theta_maxeval)
 
             # Optimise
             # Nlopt can't handle initial values outside bounds so clip values before optimisation
             # See the matching try/except around init_opt.optimize above -
             # same reasoning, and same broad Exception catch since nlopt's
             # own exception class isn't a Python RuntimeError subclass.
+            _pbar[0] = _make_stage_pbar("Theta minimization", theta_maxeval, self.verbose)
             try:
                 theta_opt.optimize(np.clip(theta0, -theta_bound, theta_bound))
             except Exception:
                 pass
+            if _pbar[0] is not None:
+                _pbar[0].close()
+            _pbar[0] = None
 
             theta = last_theta[0]
 
@@ -1343,6 +1381,8 @@ class VMSI():
             # See last_x in initial_minimization for why this is captured in
             # memory instead of written to disk on every evaluation.
             last_X = [None]
+            # See _pbar in initial_minimization - per-stage tqdm holder.
+            _pbar = [None]
 
             # objective() and nonlinear_con() below are both evaluated by nlopt
             # at the same trial point on essentially every iteration, and both
@@ -1429,7 +1469,10 @@ class VMSI():
                     dE = np.bincount(rows, weights=np.ravel(dE,order='F'))
                     grad[:] = dE.ravel()
 
-                if self.verbose:
+                if _pbar[0] is not None:
+                    _pbar[0].update(1)
+                    _pbar[0].set_postfix_str(f"E={E:.6g}", refresh=False)
+                elif self.verbose:
                     print(E)
                 return E
 
@@ -1487,7 +1530,8 @@ class VMSI():
             main_opt.set_upper_bounds(ub)
             main_opt.add_inequality_mconstraint(nonlinear_con, 1e-6*np.ones(self.dC.shape[0]))
             main_opt.add_equality_mconstraint(linear_con, 1e-6*np.ones(2))
-            main_opt.set_maxeval(2000)
+            main_maxeval = 2000
+            main_opt.set_maxeval(main_maxeval)
 
             # See the matching try/except around init_opt/theta_opt.optimize
             # in initial_minimization - same reasoning: X falls back to the
@@ -1497,10 +1541,14 @@ class VMSI():
             # failure here. Caught broadly since nlopt's own exception class
             # isn't a Python RuntimeError subclass (confirmed by this exact
             # crash escaping a narrower `except RuntimeError`).
+            _pbar[0] = _make_stage_pbar("Main minimization", main_maxeval, self.verbose)
             try:
                 main_opt.optimize(np.clip(X0.ravel(order='F'),lb,ub))
             except Exception:
                 pass
+            if _pbar[0] is not None:
+                _pbar[0].close()
+            _pbar[0] = None
 
             X = last_X[0].reshape(X0.shape, order='F')
         elif self.optimiser == 'matlab':

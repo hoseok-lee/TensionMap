@@ -14,6 +14,7 @@ dependencies:
   - scikit-image==0.19.2
   - nlopt==2.7.1
   - cyipopt==1.3.0
+  - tqdm
   - ca-certificates
   - certifi
   - openssl
