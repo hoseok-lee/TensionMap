@@ -731,6 +731,26 @@ class VMSI():
         self.cell_pairs = self.cell_pairs[good_edges, :]
         e_chord = e_chord[good_edges, :]
 
+        # classify_cells marks as "involved" any cell sharing a vertex with a
+        # bulk cell, but this network is edge-based: a cell meeting a bulk
+        # vertex only at a single point (no shared edge with anything here) has
+        # an all-zero dC column and never appears in cell_pairs. Left in
+        # involved_cells it still gets an x0/pressure row yet contributes zero
+        # gradient to the energy term, so the sum-of-pressures linear
+        # constraint is free to push its pressure to an arbitrary extreme
+        # (physically meaningless - it has no edges to satisfy Young-Laplace
+        # against). Drop these cells and compact the operators; the caller
+        # (initial_minimization) rebuilds x0 to match the smaller set.
+        used = np.unique(self.cell_pairs)
+        if 0 < used.size < len(self.involved_cells):
+            remap = np.full(len(self.involved_cells), -1, dtype=int)
+            remap[used] = np.arange(used.size)
+            self.involved_cells = self.involved_cells[used]
+            self.bulk_cells = self.bulk_cells[np.isin(self.bulk_cells, self.involved_cells)]
+            self.ext_cells = self.ext_cells[np.isin(self.ext_cells, self.involved_cells)]
+            self.dC = self.dC[:, used]
+            self.cell_pairs = remap[self.cell_pairs]
+
         self.involved_edges = -1 * np.ones(self.dC.shape[0], dtype=int)
 
         for i in range(len(self.edges)):
@@ -905,6 +925,15 @@ class VMSI():
 
         # Initialize tau
         e_cells, tau_1, tau_2, r1, r2 = self.estimate_tau()
+
+        # estimate_tau (via build_diff_operators) may have dropped degree-0
+        # cells from involved_cells after classify_cells already sized x0 to
+        # the old count - rebuild x0's rows against the pruned set so every
+        # downstream array (q0/p0/theta0, dC columns, cell_pairs indices) stays
+        # consistently sized.
+        if x0.shape[0] != len(self.involved_cells):
+            x0 = np.vstack([np.stack(self.cells['centroids'][self.involved_cells]).T,
+                            np.zeros(len(self.involved_cells))]).T
 
         # Initialize pressure
         x0[:,2] = self.estimate_pressure(x0[:,0:2], e_cells, tau_1, tau_2, r1, r2)
