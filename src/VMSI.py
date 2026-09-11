@@ -294,6 +294,10 @@ class VMSI():
         self.mask = mask
         self.isolated_tension = isolated_tension
         self.isolated_background_pressure = isolated_background_pressure
+        # Set by run_VMSI's attach_adata() when an adata is passed in - an AnnData
+        # object whose .obs has been synced with this model's self.cells (see
+        # attach_adata's docstring). None if no adata was provided.
+        self.adata = None
 
         # Mark fourfold vertices
         self.vertices['fourfold'] = [(np.shape(nverts)[0] != 3) for nverts in self.vertices['nverts']]
@@ -1934,14 +1938,69 @@ class VMSI():
             self.cells.at[self.involved_cells[c], 'stress'] = sigma[:,c]
         return
 
+    def _resolve_cell_values(self, column):
+        """
+        Look up a per-cell array of values for `column`, indexed 0..len(self.cells)-1 -
+        the same indexing as self.cells/self.mask - so plot() can colour cells by it the
+        same way it already does for 'pressure'.
+
+        Checks self.cells first. If not found there, falls back to self.adata.obs (set by
+        attach_adata/run_VMSI(adata=...)), mapping each adata row back onto its cell via
+        adata.obs['cell_id'] - the inverse of attach_adata's own row-matching, so this
+        works for columns computed in adata *after* run_VMSI (e.g. sc.tl.leiden), which
+        were never copied into self.cells in the first place.
+
+        :param column: (str) column name to look up.
+        :return: (numpy array) values indexed 0..len(self.cells)-1; numeric dtype (with NaN
+                 for missing) if the source column is numeric, else object dtype (with None
+                 for missing).
+        """
+        if column in self.cells.columns:
+            return self.cells[column].to_numpy()
+
+        if self.adata is not None and column in self.adata.obs.columns:
+            if 'cell_id' not in self.adata.obs.columns:
+                raise ValueError(
+                    f"self.adata.obs has no 'cell_id' column, so '{column}' can't be mapped "
+                    f"back onto cells - this should have been set automatically by "
+                    f"run_VMSI(adata=...)/attach_adata()."
+                )
+            col_series = self.adata.obs[column]
+            if pd.api.types.is_numeric_dtype(col_series):
+                values = np.full(len(self.cells), np.nan)
+            else:
+                values = np.full(len(self.cells), None, dtype=object)
+            cell_ids = self.adata.obs['cell_id'].to_numpy()
+            in_range = (cell_ids >= 0) & (cell_ids < len(self.cells))
+            values[cell_ids[in_range]] = col_series.to_numpy()[in_range]
+            return values
+
+        raise ValueError(
+            f"'{column}' is not a column in self.cells, and self.adata is "
+            f"{'set but has no matching adata.obs column' if self.adata is not None else 'None'} - "
+            f"nothing to plot. Available self.cells columns: {list(self.cells.columns)}."
+        )
 
     def plot(self, options='', mask=np.array([]), line_thickness=5, size=10, file=None):
         """
 
         Plots results of stress inference.
 
-        :param mask: (numpy array) image on which to overlay plotted objects. If plotting pressure, must be labelled, segmented image.
-        :param options: (list) list of options for plotting. Available options are: 'stress', 'pressure', 'tension', 'CAP'.
+        :param mask: (numpy array) image on which to overlay plotted objects. If plotting pressure
+                     or a generic attribute (see below), must be a labelled, segmented image -
+                     pass model.mask.
+        :param options: (list) list of options for plotting. The built-in options are: 'stress',
+                         'pressure', 'tension', 'cap'. Any other string is treated as a per-cell
+                         attribute to colour cells by (like 'pressure', but for any column) -
+                         looked up first in self.cells, then in self.adata.obs if an adata is
+                         attached (see attach_adata/run_VMSI(adata=...)), e.g.
+                         model.plot(['leiden'], model.mask) for a Leiden clustering computed in
+                         adata after run_VMSI. Numeric columns get a sequential colourmap and
+                         colourbar (same normalisation as 'pressure': 90th percentile clipped);
+                         non-numeric columns (e.g. cluster labels) get one discrete colour per
+                         category and a legend instead. Only the first non-built-in option found
+                         is used for cell colouring; combine it with 'tension'/'stress'/'cap' in
+                         the same call to overlay those too (e.g. ['leiden', 'tension']).
         :param line_thickness: (int) thickness of lines used for tension and CAP plotting. Default: 5.
         :param size: (int) text size for legends. Default: 10.
         :param file: (str) filename to save plot to. If none provided, outputs plot to console.
@@ -1957,6 +2016,15 @@ class VMSI():
                 f"internally relabels/resizes the mask before fitting. Pass mask=model.mask "
                 f"(this model's own stored mask) instead of your original input array."
             )
+
+        # Options that aren't one of the built-in keywords are treated as an arbitrary
+        # per-cell attribute to colour cells by - a column in self.cells, or (via
+        # _resolve_cell_values) in self.adata.obs, e.g. a Leiden cluster computed after
+        # run_VMSI(adata=...). Only the first one found is used for area colouring (a cell
+        # can only be shaded one way at a time); the rest are ignored here, same as any
+        # other unrecognised option.
+        reserved_options = ('stress', 'pressure', 'tension', 'cap')
+        generic_options = [opt for opt in options if opt not in reserved_options]
 
         # Pressure first as requires remapping cell area colours
         if mask.size > 0:
@@ -1992,6 +2060,44 @@ class VMSI():
                 uncomputed = ~np.isin(mask, involvedcells_labels) & (mask != 0)
                 img[~np.isin(mask, involvedcells_labels),:] = (1,1,1,1)
                 img[uncomputed,:] = (0.75,0.75,0.75,1)
+            elif len(generic_options) > 0:
+                generic_option = generic_options[0]
+                values = self._resolve_cell_values(generic_option)
+                is_numeric = pd.api.types.is_numeric_dtype(pd.Series(values))
+                valid_cells = np.array([c for c in range(1, len(self.cells)) if not pd.isna(values[c])])
+                if valid_cells.size == 0:
+                    raise ValueError(f"No cells have a non-missing value for '{generic_option}' - nothing to plot.")
+
+                centroids = np.array(self.cells.loc[valid_cells, 'centroids'].tolist())
+                props = measure.regionprops(mask)
+                img_centroids = np.array([np.flip(regionprops.centroid) for regionprops in props])
+                indices = np.argmin(cdist(centroids, img_centroids), axis=1)
+                cell_labels = np.array([props[i].label for i in indices])
+
+                if is_numeric:
+                    generic_colourmap = cm.get_cmap('plasma')
+                    cell_values = values[valid_cells].astype(float)
+                    generic_vmin = np.min(cell_values)
+                    generic_vmax = np.percentile(cell_values, 90)
+                    span = generic_vmax - generic_vmin
+                    img = np.zeros_like(mask).astype(float)
+                    for i, lbl in enumerate(cell_labels):
+                        norm = np.divide(cell_values[i] - generic_vmin, span) if span > 0 else 0.0
+                        img[mask == lbl] = np.clip(norm, 0, 1)
+                    img = generic_colourmap(img)
+                else:
+                    generic_categories = pd.unique(values[valid_cells])
+                    cat_colourmap = cm.get_cmap('tab20')
+                    generic_cat_colours = {cat: cat_colourmap(i % 20) for i, cat in enumerate(generic_categories)}
+                    img = np.zeros(mask.shape + (4,))
+                    for i, lbl in enumerate(cell_labels):
+                        img[mask == lbl] = generic_cat_colours[values[valid_cells[i]]]
+
+                # Same convention as pressure: true background stays white, cells present
+                # in the mask but missing a value for this attribute are shown grey.
+                uncomputed = ~np.isin(mask, cell_labels) & (mask != 0)
+                img[~np.isin(mask, cell_labels), :] = (1,1,1,1)
+                img[uncomputed, :] = (0.75,0.75,0.75,1)
             else:
                 colourmap = cm.get_cmap('Set3')
                 colours = np.array([colourmap(np.mod(i,12)) for i in range(len(np.unique(mask)))])
@@ -2021,8 +2127,27 @@ class VMSI():
             p_cb.set_label('Pressure (a.u.)', size=size)
             p_cb.ax.tick_params(labelsize=size)
 
-        if all(np.isin(options, ['stress', 'pressure', 'tension', 'cap'])):
-            for option in options:
+        # Colourbar (numeric) or legend (categorical) for a generic per-cell attribute,
+        # mirroring the pressure colourbar above - only rendered when mask.size > 0 took
+        # the generic_options branch (not the 'pressure' or plain-Set3 branches).
+        if mask.size > 0 and not np.isin('pressure', options) and len(generic_options) > 0:
+            generic_option = generic_options[0]
+            if is_numeric:
+                cax_g = divider.append_axes("right", size="5%", pad=0.5)
+                g_cb = plt.colorbar(mappable=cm.ScalarMappable(norm=colors.Normalize(generic_vmin, generic_vmax), cmap=generic_colourmap), cax=cax_g)
+                g_cb.set_label(generic_option, size=size)
+                g_cb.ax.tick_params(labelsize=size)
+            else:
+                legend_handles = [patches.Patch(color=generic_cat_colours[cat], label=str(cat)) for cat in generic_categories]
+                ax.legend(handles=legend_handles, title=generic_option, fontsize=size*0.6,
+                          title_fontsize=size*0.7, loc='center left', bbox_to_anchor=(1.02, 0.5))
+
+        # Every option that isn't one of these four keywords is already handled above (as
+        # the base cell-area colouring) or ignored - unrecognised entries here are simply
+        # skipped by the if/elif chain below, so there's no need to gate the whole loop on
+        # every option being recognised (that would also skip valid ones, e.g. requesting
+        # ['leiden', 'tension'] together used to silently draw neither).
+        for option in options:
                 if option == 'stress':
                     stress = np.array([self.cells.at[cell, 'area'] * np.array([[self.cells.at[cell, 'stress'][0], self.cells.at[cell, 'stress'][1]],[self.cells.at[cell, 'stress'][1], self.cells.at[cell, 'stress'][2]]]) for cell in range(len(self.cells))])
 
@@ -2359,9 +2484,41 @@ def detect_holes(img, hole_size_threshold=2):
 
     return holes_mask
 
+def attach_adata(model, adata):
+    """
+    Attach an AnnData object to a fitted VMSI model, copying every column
+    currently in model.cells into adata.obs - factored out of run_VMSI's
+    adata handling so it can be redone standalone (e.g. after editing
+    model.cells, or after calling model.output_results()-style post-processing).
+
+    Rows are matched via adata.obs['cell_id'] (set by run_VMSI as
+    adata.obs.reset_index().index + 1, i.e. 1-indexed row order) against
+    model.cells' row index - which is the same value as each cell's label in
+    model.mask, so this only gives meaningful results if cell_id values still
+    correspond to mask labels (true right after run_VMSI(..., bbox=...), since
+    cropping doesn't renumber labels; not true if cells were relabelled
+    in between, e.g. by min_cell_size/hole detection/expand_distance removing
+    or renumbering cells - run_VMSI already accounts for this by assigning
+    cell_id before any of those steps run). Any cell_id with no matching row
+    in model.cells (out of range, or a cell that got dropped along the way)
+    gets NaN for every model.cells column rather than raising.
+
+    :param model: (VMSI) a fitted VMSI model.
+    :param adata: (AnnData) must already have a 'cell_id' column in adata.obs.
+    :return: adata, with model.cells' columns added to adata.obs. model.adata is also
+             set to adata as a side effect, so the model can be reached from either side.
+    """
+    model.adata = adata
+    cell_ids = adata.obs['cell_id'].to_numpy()
+    matched = model.cells.reindex(cell_ids)
+    matched.index = adata.obs.index
+    for col in matched.columns:
+        adata.obs[col] = matched[col]
+    return adata
+
 def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
              optimiser='nlopt', isolated_tension=1.0, isolated_background_pressure=0.0, expand_distance=0,
-             min_cell_size=0, hole_size_threshold=2, n_jobs=None):
+             min_cell_size=0, hole_size_threshold=2, bbox=None, adata=None, n_jobs=None):
     """
     Main function to run stress inference in a single step.
 
@@ -2428,6 +2585,24 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
                    process (tiles are independent until the pairwise-overlap merge step afterwards, so
                    this parallelises cleanly). None uses all available CPU cores (os.cpu_count()); 1 fits
                    tiles sequentially in the current process, same as before this option existed. Default: None.
+    :param bbox: (list/tuple of 4 ints, or None) if given, [row_start, row_end, col_start, col_end] -
+                 img is cropped to img[row_start:row_end, col_start:col_end] before anything else runs
+                 (labelling, min_cell_size, hole detection, expand_distance, tiling, etc.), so the rest
+                 of the pipeline only ever sees the cropped region. Useful for testing/debugging on a
+                 small region of a much larger mask without pre-cropping it yourself. Default: None
+                 (use the whole image).
+    :param adata: (AnnData, optional) if given, adata.obs['cell_id'] is set to
+                  adata.obs.reset_index().index + 1 (1-indexed row order, matching mask label
+                  values) before anything else runs. If bbox is also given, adata is then
+                  subset to only the cell_ids still present in the cropped mask. A copy is
+                  made - your original adata object is never modified in place. Once the model
+                  is fit, adata is stored as model.adata, and every column currently in
+                  model.cells is copied into adata.obs, row-matched by cell_id against
+                  model.cells' row index (see attach_adata() for the standalone version of this
+                  step, e.g. to redo it after further editing model.cells). This only happens
+                  for the normal VMSI-object return path - if the mask has too little confluent
+                  tissue and run_VMSI falls back to run_isolated_cells() (a plain DataFrame, not
+                  a VMSI object), adata is left untouched. Default: None (disabled).
 
     :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology
              metrics - UNLESS the image is fully non-confluent (no cell has any real neighbour), in which case
@@ -2436,6 +2611,24 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
     """
 
     warnings.filterwarnings('ignore')
+
+    if bbox is not None:
+        if len(bbox) != 4:
+            raise ValueError(f"bbox must be [row_start, row_end, col_start, col_end] (4 values), got {bbox}")
+        row_start, row_end, col_start, col_end = bbox
+        img = img[row_start:row_end, col_start:col_end]
+
+    if adata is not None:
+        # Copy rather than mutate the caller's object in place - cell_id below is
+        # added either way, but the bbox-driven subsetting further down should
+        # never surprise a caller who's still holding onto their original adata.
+        adata = adata.copy()
+        adata.obs['cell_id'] = adata.obs.reset_index().index + 1
+        if bbox is not None:
+            # img is already cropped above - cell_id values are mask label values,
+            # so keep only the cells whose label actually survived the crop.
+            present_ids = np.unique(img)
+            adata = adata[adata.obs['cell_id'].isin(present_ids)].copy()
 
     # If cells are not labelled, label them
     if not is_labelled:
@@ -2588,8 +2781,14 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
                   "run_isolated_cells (per-cell Young-Laplace pressure inference). If this "
                   "mask should have had enough confluent tissue to avoid this, the error "
                   "above is worth a closer look rather than trusting this fallback.")
+            # run_isolated_cells returns a plain DataFrame, not a VMSI object, so it has
+            # nowhere to attach adata to (see attach_adata's docstring) - fall through to
+            # the common return below rather than attaching there.
             return run_isolated_cells(img, is_labelled=True, background_pressure=isolated_background_pressure,
                                        tension=isolated_tension, verbose=verbose)
+
+    if adata is not None:
+        adata = attach_adata(model, adata)
     return model
 
 def _fit_circle_to_contour(contour_xy):
