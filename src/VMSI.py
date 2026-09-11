@@ -2379,11 +2379,12 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
 
     Internal tissue holes are detected automatically (detect_holes(), the
     "Process mask and detect holes in tissue" step from
-    notebooks/00_run_tensionmap.ipynb) on every call - no separate flag or
-    manual holes_mask needed. This runs after any boundary-carving this
-    function does itself (expand_distance), so it always sees the mask in its
-    final, correctly-resolutioned form. If you need to inspect or override the
-    detected holes, call detect_holes(img) yourself.
+    notebooks/00_run_tensionmap.ipynb) on every call unless hole_size_threshold
+    is set to None - no separate flag or manual holes_mask needed. This runs
+    after any boundary-carving this function does itself (expand_distance), so
+    it always sees the mask in its final, correctly-resolutioned form. If you
+    need to inspect or override the detected holes, call detect_holes(img)
+    yourself.
 
     :param verbose: (bool) whether to provide detailed output. Default:False.
     :param img: (numpy array) segmented image.
@@ -2416,12 +2417,13 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
                            universally correct threshold - it depends on your image's resolution and
                            actual cell size (a real small cell shouldn't be caught by this), so this is
                            opt-in rather than defaulting to some fixed size. Default: 0 (disabled).
-    :param hole_size_threshold: (float) passed straight to detect_holes() - a region is flagged as an
-                                 internal hole if its area exceeds this many times the mean area across
-                                 all regions in the processed mask. Lower this if genuine holes (e.g.
-                                 small lumens) are being missed; raise it if normal large cells are being
-                                 wrongly flagged as holes. Default: 2 (matches
-                                 notebooks/00_run_tensionmap.ipynb).
+    :param hole_size_threshold: (float or None) passed straight to detect_holes() - a region is
+                                 flagged as an internal hole if its area exceeds this many times the
+                                 mean area across all regions in the processed mask. Lower this if
+                                 genuine holes (e.g. small lumens) are being missed; raise it if normal
+                                 large cells are being wrongly flagged as holes. Set to None to skip
+                                 hole detection entirely (holes_mask=None, the pre-detect_holes
+                                 behaviour). Default: 2 (matches notebooks/00_run_tensionmap.ipynb).
     :param n_jobs: (int) only used when tile=True. Number of tiles to fit in parallel, each in its own
                    process (tiles are independent until the pairwise-overlap merge step afterwards, so
                    this parallelises cleanly). None uses all available CPU cores (os.cpu_count()); 1 fits
@@ -2467,11 +2469,16 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
             print(f"Removed {n_slivers} sub-pixel boundary artifacts (<{sliver_min_size}px)...")
 
     # Detect internal tissue holes (notebooks/00_run_tensionmap.ipynb's hole-detection
-    # step) unconditionally, now that img is in its final boundary-separated form -
-    # whether that's as originally supplied, or via expand_distance just above.
-    if verbose:
-        print("Detecting internal holes...")
-    holes_mask = detect_holes(img, hole_size_threshold=hole_size_threshold)
+    # step), now that img is in its final boundary-separated form - whether that's as
+    # originally supplied, or via expand_distance just above. hole_size_threshold=None
+    # opts out entirely (holes_mask=None, same as pre-detect_holes behaviour) rather
+    # than running detect_holes just to get an all-zero mask back.
+    if hole_size_threshold is None:
+        holes_mask = None
+    else:
+        if verbose:
+            print("Detecting internal holes...")
+        holes_mask = detect_holes(img, hole_size_threshold=hole_size_threshold)
 
     # Test whether there are enough cells to tile image
     if not len(np.unique(img))-1 > 2*cells_per_tile and tile:
