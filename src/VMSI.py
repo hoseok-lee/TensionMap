@@ -2005,7 +2005,11 @@ class VMSI():
         :param size: (int) text size for legends. Default: 10.
         :param file: (str) filename to save plot to. If none provided, outputs plot to console.
         """
-        options = [option.lower() for option in options]
+        # Only normalise case for the recognised built-in keywords (so 'Tension'/'TENSION'
+        # still work as before) - a generic option is an actual column name in self.cells or
+        # self.adata.obs, which is case-sensitive, so it must be left exactly as given.
+        _reserved_options = ('stress', 'pressure', 'tension', 'cap')
+        options = [option.lower() if option.lower() in _reserved_options else option for option in options]
 
         if mask.size > 0 and self.mask is not None and mask.shape != self.mask.shape:
             raise ValueError(
@@ -2023,8 +2027,7 @@ class VMSI():
         # run_VMSI(adata=...). Only the first one found is used for area colouring (a cell
         # can only be shaded one way at a time); the rest are ignored here, same as any
         # other unrecognised option.
-        reserved_options = ('stress', 'pressure', 'tension', 'cap')
-        generic_options = [opt for opt in options if opt not in reserved_options]
+        generic_options = [opt for opt in options if opt not in _reserved_options]
 
         # Pressure first as requires remapping cell area colours
         if mask.size > 0:
