@@ -1946,9 +1946,10 @@ class VMSI():
 
         Checks self.cells first. If not found there, falls back to self.adata.obs (set by
         attach_adata/run_VMSI(adata=...)), mapping each adata row back onto its cell via
-        adata.obs['cell_id'] - the inverse of attach_adata's own row-matching, so this
-        works for columns computed in adata *after* run_VMSI (e.g. sc.tl.leiden), which
-        were never copied into self.cells in the first place.
+        adata.obs['cell_id'] against self.cells['cell_id'] (see _assign_cell_ids/
+        _cell_id_lookup) - the inverse of attach_adata's own join, so this works for
+        columns computed in adata *after* run_VMSI (e.g. sc.tl.leiden), which were
+        never copied into self.cells in the first place.
 
         :param column: (str) column name to look up.
         :return: (numpy array) values indexed 0..len(self.cells)-1; numeric dtype (with NaN
@@ -1965,14 +1966,20 @@ class VMSI():
                     f"back onto cells - this should have been set automatically by "
                     f"run_VMSI(adata=...)/attach_adata()."
                 )
+            if 'cell_id' not in self.cells.columns:
+                raise ValueError(
+                    f"self.cells has no 'cell_id' column, so '{column}' can't be mapped back "
+                    f"onto cells - this should have been set automatically by run_VMSI."
+                )
             col_series = self.adata.obs[column]
             if pd.api.types.is_numeric_dtype(col_series):
                 values = np.full(len(self.cells), np.nan)
             else:
                 values = np.full(len(self.cells), None, dtype=object)
-            cell_ids = self.adata.obs['cell_id'].to_numpy()
-            in_range = (cell_ids >= 0) & (cell_ids < len(self.cells))
-            values[cell_ids[in_range]] = col_series.to_numpy()[in_range]
+            lookup = _cell_id_lookup(self.cells)
+            rows = lookup.reindex(self.adata.obs['cell_id'].to_numpy())
+            valid = rows.notna().to_numpy()
+            values[rows[valid].to_numpy().astype(int)] = col_series.to_numpy()[valid]
             return values
 
         raise ValueError(
@@ -2487,6 +2494,69 @@ def detect_holes(img, hole_size_threshold=2):
 
     return holes_mask
 
+def _cell_id_lookup(cells):
+    """
+    Build a cell_id -> row-index mapping from a cells DataFrame that has a
+    'cell_id' column (see _assign_cell_ids), for joining against
+    adata.obs['cell_id']. Cells with no recovered original id (-1, e.g. a new
+    sub-pixel boundary artifact with no real original counterpart) or a cell_id
+    shared by more than one row (an ambiguous match - can happen if run_VMSI's
+    own preprocessing merged/split what was originally more than one cell) are
+    excluded, so looking either up safely reports "no match" rather than
+    returning an arbitrary one.
+
+    :param cells: (pandas DataFrame) a VMSI model's self.cells, with a 'cell_id' column.
+    :return: (pandas Series) index is cell_id, values are the corresponding row index
+             into cells.
+    """
+    lookup = pd.Series(cells.index, index=cells['cell_id'])
+    return lookup[~lookup.index.duplicated(keep=False) & (lookup.index != -1)]
+
+def _assign_cell_ids(model, orig_cell_props, expand_distance):
+    """
+    Populate model.cells['cell_id'] with each cell's original label value - the
+    label it had right after run_VMSI's bbox cropping, before min_cell_size/
+    detect_holes/expand_distance (and Segmenter's own internal relabel() step)
+    potentially reassigned fresh, dense label numbers. Recovered via
+    nearest-centroid matching, the same technique segment.py's own
+    process_segmented_image/polygon_perimeter already uses internally to carry
+    a label through Segmenter's relabel() specifically.
+
+    A cell whose nearest original centroid is farther away than its own
+    approximate radius (sqrt(area/pi) - e.g. a new sub-pixel boundary artifact,
+    or a cell min_cell_size/expand_distance split or merged enough to have moved)
+    gets -1 rather than an arbitrary nearby label. cell_id is only ever an
+    approximation across a min_cell_size/expand_distance-driven merge or split -
+    exact for the common case where a cell's identity and shape survive unchanged.
+    Cell 0 (background) always gets cell_id 0.
+
+    :param model: (VMSI) a fitted VMSI model (or merge_models() output).
+    :param orig_cell_props: (dict) {original_label: (x, y) centroid}, as captured by
+                             run_VMSI right after bbox cropping.
+    :param expand_distance: (int) the expand_distance run_VMSI was called with -
+                             expand_distance>0 doubles the mask's resolution via
+                             find_boundaries(mode='subpixel'), so the original
+                             (pre-doubling) centroids need scaling up by 2x to compare
+                             against model.cells' (post-doubling) centroids.
+    """
+    cell_id = np.full(len(model.cells), -1, dtype=int)
+    cell_id[0] = 0
+    if len(orig_cell_props) > 0 and len(model.cells) > 1:
+        orig_labels = np.array(list(orig_cell_props.keys()))
+        orig_centroids = np.array(list(orig_cell_props.values()), dtype=float)
+        if expand_distance > 0:
+            orig_centroids = orig_centroids * 2
+
+        cell_indices = np.arange(1, len(model.cells))
+        final_centroids = np.array(model.cells.loc[cell_indices, 'centroids'].tolist())
+        dists = cdist(final_centroids, orig_centroids)
+        nearest = np.argmin(dists, axis=1)
+        match_dist = dists[np.arange(len(cell_indices)), nearest]
+        approx_radius = np.sqrt(model.cells.loc[cell_indices, 'area'].to_numpy() / np.pi)
+        matched = match_dist <= approx_radius
+        cell_id[cell_indices] = np.where(matched, orig_labels[nearest], -1)
+    model.cells['cell_id'] = cell_id
+
 def attach_adata(model, adata):
     """
     Attach an AnnData object to a fitted VMSI model, copying every column
@@ -2494,29 +2564,34 @@ def attach_adata(model, adata):
     adata handling so it can be redone standalone (e.g. after editing
     model.cells, or after calling model.output_results()-style post-processing).
 
-    Rows are matched via adata.obs['cell_id'] (set by run_VMSI as
-    adata.obs.reset_index().index + 1, i.e. 1-indexed row order) against
-    model.cells' row index - which is the same value as each cell's label in
-    model.mask, so this only gives meaningful results if cell_id values still
-    correspond to mask labels (true right after run_VMSI(..., bbox=...), since
-    cropping doesn't renumber labels; not true if cells were relabelled
-    in between, e.g. by min_cell_size/hole detection/expand_distance removing
-    or renumbering cells - run_VMSI already accounts for this by assigning
-    cell_id before any of those steps run). Any cell_id with no matching row
-    in model.cells (out of range, or a cell that got dropped along the way)
-    gets NaN for every model.cells column rather than raising.
+    Rows are matched via adata.obs['cell_id'] against model.cells['cell_id']
+    (see _assign_cell_ids) - the cell's *original* label value, recovered via
+    nearest-centroid matching regardless of any relabelling run_VMSI's own
+    preprocessing did in between, rather than model.cells' row index (which is
+    only a dense, internally-assigned position with no relationship to the
+    original mask's label values). Any adata cell_id with no matching row in
+    model.cells (out of range, dropped along the way, or an ambiguous match -
+    see _cell_id_lookup) gets NaN for every model.cells column rather than
+    raising or silently joining to the wrong cell.
 
-    :param model: (VMSI) a fitted VMSI model.
+    :param model: (VMSI) a fitted VMSI model, with a 'cell_id' column in model.cells
+                  (set automatically by run_VMSI).
     :param adata: (AnnData) must already have a 'cell_id' column in adata.obs.
     :return: adata, with model.cells' columns added to adata.obs. model.adata is also
              set to adata as a side effect, so the model can be reached from either side.
     """
     model.adata = adata
-    cell_ids = adata.obs['cell_id'].to_numpy()
-    matched = model.cells.reindex(cell_ids)
-    matched.index = adata.obs.index
-    for col in matched.columns:
-        adata.obs[col] = matched[col]
+    lookup = _cell_id_lookup(model.cells)
+    rows = lookup.reindex(adata.obs['cell_id'].to_numpy())
+    valid = rows.notna().to_numpy()
+    matched_rows = rows[valid].to_numpy().astype(int)
+
+    for col in model.cells.columns:
+        if col == 'cell_id':
+            continue
+        out = pd.Series([None] * len(adata.obs), index=adata.obs.index, dtype=object)
+        out.iloc[np.where(valid)[0]] = model.cells[col].to_numpy()[matched_rows]
+        adata.obs[col] = out
     return adata
 
 def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=False, overlap=0.3,
@@ -2595,17 +2670,24 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
                  small region of a much larger mask without pre-cropping it yourself. Default: None
                  (use the whole image).
     :param adata: (AnnData, optional) if given, adata.obs['cell_id'] is set to
-                  adata.obs.reset_index().index + 1 (1-indexed row order, matching mask label
-                  values) before anything else runs. If bbox is also given, adata is then
-                  subset to only the cell_ids still present in the cropped mask. A copy is
-                  made - your original adata object is never modified in place. Once the model
-                  is fit, adata is stored as model.adata, and every column currently in
-                  model.cells is copied into adata.obs, row-matched by cell_id against
-                  model.cells' row index (see attach_adata() for the standalone version of this
-                  step, e.g. to redo it after further editing model.cells). This only happens
-                  for the normal VMSI-object return path - if the mask has too little confluent
-                  tissue and run_VMSI falls back to run_isolated_cells() (a plain DataFrame, not
-                  a VMSI object), adata is left untouched. Default: None (disabled).
+                  adata.obs.reset_index().index + 1 (1-indexed row order, matching the input
+                  mask's original label values) before anything else runs. If bbox is also
+                  given, adata is then subset to only the cell_ids still present in the
+                  cropped mask. A copy is made - your original adata object is never modified
+                  in place. model.cells is always given a matching 'cell_id' column too (see
+                  _assign_cell_ids), recovered via nearest-centroid matching regardless of any
+                  relabelling min_cell_size/detect_holes/expand_distance/tiling/Segmenter's own
+                  internal processing did along the way - model.cells' own row index has no
+                  relationship to the original mask's label values by the time the model is
+                  built (segment.py's Segmenter unconditionally relabels internally), so this
+                  cell_id column is what makes the join back to adata.obs meaningful. Once the
+                  model is fit, adata is stored as model.adata, and every column currently in
+                  model.cells is copied into adata.obs, row-matched via cell_id (see
+                  attach_adata() for the standalone version of this step, e.g. to redo it after
+                  further editing model.cells). This only happens for the normal VMSI-object
+                  return path - if the mask has too little confluent tissue and run_VMSI falls
+                  back to run_isolated_cells() (a plain DataFrame, not a VMSI object), adata is
+                  left untouched. Default: None (disabled).
 
     :return: VMSI object containing the inferred tensions, pressures and stress, as well as cell morphology
              metrics - UNLESS the image is fully non-confluent (no cell has any real neighbour), in which case
@@ -2633,10 +2715,19 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
             present_ids = np.unique(img)
             adata = adata[adata.obs['cell_id'].isin(present_ids)].copy()
 
-    # If cells are not labelled, label them
+    # Capture each cell's original label and centroid right here, before any of the
+    # preprocessing below (min_cell_size/detect_holes/expand_distance, and Segmenter's
+    # own internal relabel() step further down) potentially reassigns fresh, dense
+    # label numbers - segment.py:79 (self.relabel()) does exactly this unconditionally,
+    # so model.cells' row index generally has no relationship to the original mask's
+    # label values by the time the model is built. This is what lets _assign_cell_ids
+    # recover the original identity later via nearest-centroid matching, so model.cells
+    # can still be joined back to adata.obs via cell_id (see attach_adata) even though
+    # its own row index can't be used for that anymore.
     if not is_labelled:
         img = measure.label(img)
         is_labelled = True
+    _orig_cell_props = {r.label: np.flip(r.centroid) for r in measure.regionprops(img) if r.label != 0}
 
     if min_cell_size > 0:
         img, n_removed = _remove_small_regions(img, min_cell_size, fill_distance=5)
@@ -2790,6 +2881,7 @@ def run_VMSI(img, is_labelled=False, tile=False, cells_per_tile=150, verbose=Fal
             return run_isolated_cells(img, is_labelled=True, background_pressure=isolated_background_pressure,
                                        tension=isolated_tension, verbose=verbose)
 
+    _assign_cell_ids(model, _orig_cell_props, expand_distance)
     if adata is not None:
         adata = attach_adata(model, adata)
     return model
